@@ -8,8 +8,8 @@
 # * checks for a Git Tag that looks like a release
 # * builds artifacts with dist (archives, installers, hashes)
 # * uploads those artifacts to temporary workflow zip
-# * on success, uploads the artifacts to a GitHub Release
-# * uploads stable download files to Alibaba Cloud OSS for the official website
+# * on success, uploads the artifacts to a GitHub prerelease
+# * manual promotion to a stable release triggers publish-oss.yml
 #
 # Note that the GitHub Release will be created with a generated
 # title/body based on your changelogs.
@@ -37,8 +37,8 @@ permissions:
 # will hard limit this to 3 tags per commit, as it will assume more tags is a
 # mistake.
 #
-# If there's a prerelease-style suffix to the version, then the release(s)
-# will be marked as a prerelease.
+# All releases start as prereleases for manual testing. After promoting a
+# release to stable in GitHub, publish-oss.yml uploads the tested installers.
 on:
   push:
     tags:
@@ -336,65 +336,6 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
-  # Publish installers and the auto-update manifest to Alibaba Cloud OSS.
-  # Versioned objects keep update downloads stable; the stable aliases keep the
-  # existing website URL working:
-  # https://rains-ailurus-cn.oss-cn-shanghai.aliyuncs.com/clippi/releases/<file>
-  upload-to-oss:
-    name: Publish installers and update manifest to OSS
-    needs:
-      - plan
-      - build-local-artifacts
-      - build-global-artifacts
-    # Only publish stable version tags, after all build artifacts are available.
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease && needs.build-local-artifacts.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') }}
-    runs-on: ubuntu-22.04
-    # Shared with publish-oss.yml so only one OSS publisher runs at a time.
-    # `queue: max` keeps every triggered release queued instead of letting a
-    # third run cancel the pending one (the default is `queue: single`).
-    # OSS has no reliable compare-and-delete, so this concurrency group is the
-    # primary cross-workflow mutual exclusion; scripts/publish_oss.py keeps a
-    # secondary lock object.
-    concurrency:
-      group: clippi-oss-publish
-      cancel-in-progress: false
-      queue: max
-    env:
-      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
-      OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
-      OSS_ENDPOINT: "oss-cn-shanghai.aliyuncs.com"
-      OSS_BUCKET: "rains-ailurus-cn"
-      OSS_PREFIX: "clippi/releases"
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Download local release artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: artifacts-build-local-*
-          path: artifacts
-          merge-multiple: true
-
-      - name: Extract release notes
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME##*/}"
-          VERSION="${VERSION#v}"
-          bash scripts/extract_release_notes.sh "$VERSION" RELEASES.md > release-notes.md
-          test -s release-notes.md
-
-      - name: Publish installers and update manifest to Alibaba Cloud OSS
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m pip install --user --quiet oss2
-          python3 scripts/publish_oss.py \
-            --artifacts artifacts \
-            --tag "$GITHUB_REF_NAME" \
-            --notes-file release-notes.md
   # Determines if we should publish/announce
   host:
     needs:
@@ -453,7 +394,6 @@ jobs:
       - name: Create GitHub Release
         shell: bash
         env:
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
           TAG: "${{ needs.plan.outputs.tag }}"
@@ -484,7 +424,7 @@ jobs:
           gh release delete "$TAG" --cleanup-tag -y || true
           # Title follows the repo convention of the tag name (v0.4.4, v0.4.5)
           # instead of cargo-dist's changelog-derived "Version 0.4.5".
-          gh release create "$TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$TAG" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          gh release create "$TAG" --target "$RELEASE_COMMIT" --prerelease --title "$TAG" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
       - name: Add DMG and NSIS to release notes
         env:
           TAG: "${{ needs.plan.outputs.tag }}"

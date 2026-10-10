@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
 """Publish Clippi installers and the auto-update manifest to Aliyun OSS.
 
-Called by the release workflow after all build artifacts are available. Each
-platform installer is uploaded twice:
+Called after promotion to stable. Each installer is uploaded once to its
+version directory with a versioned filename. The website resolves latest.json
+on the server and redirects to the package. The manifest is published after
+all packages are available; older version directories are then removed.
 
-  * ``<prefix>/v<version>/<stable-name>`` — immutable, long-lived object the
-    update manifest points at (no check/download race with newer releases).
-  * ``<prefix>/<stable-name>``           — stable alias used by the website
-    download buttons.
-
-``<prefix>/latest.json`` is uploaded last so the desktop client can only ever
-observe a complete release. It contains the version, release notes and, for
-every platform, the object name/path, size and SHA256 the client verifies
-before installing.
-
-The stable index is **monotonic**: before touching the stable aliases or
+The stable index is **monotonic**: before updating
 ``latest.json``, the publisher reads the currently published manifest and only
 advances it when the incoming version is the same or newer. Backfilling an
 older release therefore uploads its versioned artifacts without rolling the
@@ -206,7 +198,7 @@ def read_notes(path: str | None) -> str:
 
 def build_plan(artifacts: Path, version: str) -> list[dict]:
     plan = []
-    for pattern, stable_name, platform, content_type in UPLOADS:
+    for pattern, _stable_name, platform, content_type in UPLOADS:
         source = find_artifact(artifacts, pattern)
         # The Windows build output is versioned; a mismatch means the workflow
         # downloaded the wrong release's artifacts.
@@ -217,7 +209,10 @@ def build_plan(artifacts: Path, version: str) -> list[dict]:
         plan.append(
             {
                 "source": source,
-                "stable_name": stable_name,
+                "stable_name": (
+                    source.name if platform == "windows-x86_64"
+                    else f"Clippi_{version}_{platform.removeprefix('macos-')}.dmg"
+                ),
                 "platform": platform,
                 "content_type": content_type,
                 "size": source.stat().st_size,
@@ -445,6 +440,25 @@ def release_publish_lock(bucket, key: str, owner: str, etag: str) -> None:
     )
 
 
+def cleanup_old_releases(bucket, prefix: str, version: str) -> None:
+    """Delete older SemVer directories only after latest is verified."""
+    import oss2
+
+    root = f"{prefix}/"
+    current = version_core(version)
+    for obj in oss2.ObjectIterator(bucket, prefix=root):
+        relative = obj.key.removeprefix(root)
+        directory, separator, name = relative.partition("/")
+        if not separator or not directory.startswith("v") or not name:
+            continue
+        match = SEMVER_RE.fullmatch(directory[1:])
+        if not match:
+            continue
+        if version_core(directory[1:]) < current:
+            bucket.delete_object(obj.key)
+            print(f"Removed old release object {obj.key}")
+
+
 def main() -> int:
     args = parse_args()
     version = release_version(args.tag)
@@ -469,7 +483,6 @@ def main() -> int:
                 f"[dry-run] {item['source']} -> {prefix}/v{version}/{item['stable_name']} "
                 f"({item['size']} bytes, sha256 {item['sha256']})"
             )
-            print(f"[dry-run] {item['source']} -> {prefix}/{item['stable_name']} (stable alias)")
         print(f"[dry-run] manifest -> {prefix}/{MANIFEST_NAME}")
         print(manifest_bytes.decode("utf-8"))
         return 0
@@ -517,21 +530,10 @@ def main() -> int:
         if not should_advance_latest(version, published_version):
             print(
                 f"Skipping latest pointers: {version} is older than published "
-                f"{published_version}; stable aliases and {MANIFEST_NAME} left untouched"
+                f"{published_version}; {MANIFEST_NAME} left untouched"
             )
         else:
-            # 3. Stable aliases used by the official website download buttons.
-            for item in plan:
-                key = f"{prefix}/{item['stable_name']}"
-                print(f"Uploading {item['source']} -> oss://{args.bucket}/{key}")
-                bucket.put_object_from_file(
-                    key,
-                    str(item["source"]),
-                    headers=object_headers(item["content_type"], "no-cache"),
-                )
-                verify_acl(bucket, key)
-
-            # 4. Manifest last, so clients only ever see a complete release.
+            # Manifest last, so clients only ever see a complete release.
             print(f"Uploading manifest -> oss://{args.bucket}/{manifest_key}")
             bucket.put_object(
                 manifest_key,
@@ -546,6 +548,10 @@ def main() -> int:
             if remote != manifest_bytes:
                 raise SystemExit("uploaded manifest does not match the local manifest")
             advanced = True
+            try:
+                cleanup_old_releases(bucket, prefix, version)
+            except Exception as exc:
+                print(f"::warning::old release cleanup failed: {exc}")
     finally:
         release_publish_lock(bucket, lock_key, lock_owner, lock_etag)
 
