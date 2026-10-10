@@ -4,6 +4,8 @@
 //! --- auto-hide on focus loss, and hotkey-triggered show. Replaces the ---
 //! Slint-era `Frontend` + `FocusService` + `HotkeyService` + `Looper` combo.
 
+use std::cell::Cell;
+use std::rc::Rc;
 #[cfg(target_os = "windows")]
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +44,42 @@ use crate::ui::quick_paste::{
 
 /// Shared foreground app name for cross-service coordination.
 pub type ForegroundAppName = Arc<Mutex<String>>;
+
+/// UI-thread-only, scoped suspension for native dialogs. Separate from the
+/// user's auto-hide preference; overlapping dialogs each retain their scope.
+#[derive(Default)]
+struct NativeDialogState {
+    active: Cell<usize>,
+    resume_after: Cell<Option<Instant>>,
+}
+
+impl NativeDialogState {
+    fn suspend(self: &Rc<Self>) -> NativeDialogGuard {
+        self.active.set(self.active.get() + 1);
+        self.resume_after.set(None);
+        NativeDialogGuard(self.clone())
+    }
+
+    fn is_suppressed(&self, now: Instant) -> bool {
+        self.active.get() > 0 || self.resume_after.get().is_some_and(|until| now <= until)
+    }
+}
+
+/// Dropping the foreground task (including cancellation) restores auto-hide.
+pub struct NativeDialogGuard(Rc<NativeDialogState>);
+
+impl Drop for NativeDialogGuard {
+    fn drop(&mut self) {
+        let remaining = self.0.active.get() - 1;
+        self.0.active.set(remaining);
+        if remaining == 0 {
+            // Native focus restoration can arrive after the dialog resolves.
+            self.0.resume_after.set(Some(
+                Instant::now() + Duration::from_millis(SUPPRESS_DURATION_MS),
+            ));
+        }
+    }
+}
 
 /// Result from a completed data maintenance job.
 #[derive(Debug, Clone)]
@@ -410,6 +448,7 @@ pub struct WindowManager {
     auto_hide: bool,
     visible: bool,
     suppress_until: Option<Instant>,
+    native_dialogs: Rc<NativeDialogState>,
 
     // --- Platform resources ---
     hotkey: Option<Box<dyn HotkeyListener>>,
@@ -622,6 +661,7 @@ impl WindowManager {
             auto_hide: settings.auto_hide,
             visible: !settings.silent_start,
             suppress_until: Some(Instant::now() + Duration::from_millis(SUPPRESS_DURATION_MS)),
+            native_dialogs: Rc::default(),
             hotkey: None,
             win_v_takeover_status: WinVTakeoverStatus::Disabled,
             #[cfg(target_os = "windows")]
@@ -2876,9 +2916,18 @@ impl WindowManager {
     }
 
     fn is_suppressed(&self) -> bool {
-        self.suppress_until
-            .map(|until| Instant::now() <= until)
-            .unwrap_or(false)
+        let now = Instant::now();
+        self.native_dialogs.is_suppressed(now)
+            || self
+                .suppress_until
+                .map(|until| now <= until)
+                .unwrap_or(false)
+    }
+
+    /// Acquire before opening a native picker; keep the guard until it closes.
+    /// No settings are changed or saved by this temporary suspension.
+    pub fn suspend_auto_hide_for_dialog(&self) -> NativeDialogGuard {
+        self.native_dialogs.suspend()
     }
 
     // --- Window operations (platform-specific) ---
@@ -6183,5 +6232,45 @@ mod visibility_guard_tests {
         assert!(!main_should_hide(true, false, true));
         assert!(!quick_should_hide(true, false, false));
         assert!(!quick_should_hide(true, false, true));
+    }
+}
+
+#[cfg(test)]
+mod native_dialog_tests {
+    use super::NativeDialogState;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn overlapping_dialogs_keep_auto_hide_suspended_until_the_last_closes() {
+        let state = Rc::new(NativeDialogState::default());
+        assert!(!state.is_suppressed(Instant::now()));
+        let first = state.suspend();
+        let second = state.suspend();
+        drop(first);
+        assert!(state.is_suppressed(Instant::now() + Duration::from_secs(3600)));
+        drop(second);
+        let until = state.resume_after.get().unwrap();
+        assert!(state.is_suppressed(until));
+        assert!(!state.is_suppressed(until + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn cancelled_dialog_task_releases_its_suspension_and_new_dialogs_reset_grace() {
+        let state = Rc::new(NativeDialogState::default());
+        let guard = state.suspend();
+        let task = async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        };
+        assert_eq!(state.active.get(), 1);
+        drop(task);
+        assert_eq!(state.active.get(), 0);
+        assert!(state.resume_after.get().is_some());
+        let next = state.suspend();
+        assert!(state.resume_after.get().is_none());
+        drop(next);
+        let until = state.resume_after.get().unwrap();
+        assert!(!state.is_suppressed(until + Duration::from_millis(1)));
     }
 }

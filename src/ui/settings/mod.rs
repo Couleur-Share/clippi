@@ -111,6 +111,8 @@ pub struct SettingsPanel {
     max_items_input: Entity<InputState>,
     /// Pending async file dialog for changing the database path.
     _db_path_dialog_task: Option<Task<()>>,
+    local_backup_busy: bool,
+    _local_backup_task: Option<Task<()>>,
     /// Focus-out subscription for the max-items input (auto-save on blur).
     _max_items_focus_sub: gpui::Subscription,
     /// Whether the retention-days field is in editing mode.
@@ -248,6 +250,8 @@ impl SettingsPanel {
             editing_max_items: false,
             max_items_input,
             _db_path_dialog_task: None,
+            local_backup_busy: false,
+            _local_backup_task: None,
             _max_items_focus_sub,
             editing_retention_days: false,
             retention_days_input,

@@ -36,6 +36,113 @@ pub struct ResetDataDirState {
 }
 
 impl SettingsPanel {
+    fn start_local_backup(&mut self, restore: bool, cx: &mut Context<Self>) {
+        if self.local_backup_busy || self.window_manager.read(cx).is_maintenance_running() {
+            return;
+        }
+        self.local_backup_busy = true;
+        cx.notify();
+        let settings = self.state.read(cx).settings.clone();
+        let dialog_guard = self.window_manager.read(cx).suspend_auto_hide_for_dialog();
+        self._local_backup_task = Some(cx.spawn(async move |weak, cx| {
+            let result = async {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .add_filter("Clippi ZIP", &["zip"])
+                    .set_title(if restore {
+                        I18nKey::BtnLocalRestore.text()
+                    } else {
+                        I18nKey::BtnLocalBackup.text()
+                    });
+                let selected = if restore {
+                    dialog.pick_file().await
+                } else {
+                    dialog
+                        .set_file_name(format!(
+                            "clippi-backup-{}.zip",
+                            chrono::Local::now().format("%Y%m%d-%H%M%S")
+                        ))
+                        .save_file()
+                        .await
+                };
+                let Some(file) = selected else {
+                    return Ok(None);
+                };
+                if restore {
+                    let answer = rfd::AsyncMessageDialog::new()
+                        .set_title(I18nKey::BtnLocalRestore.text())
+                        .set_description(I18nKey::LocalRestoreConfirm.text())
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_buttons(rfd::MessageButtons::OkCancel)
+                        .show()
+                        .await;
+                    if answer != rfd::MessageDialogResult::Ok {
+                        return Ok(None);
+                    }
+                }
+                let path = file.path().to_path_buf();
+                drop(dialog_guard);
+                let result = cx
+                    .background_spawn(async move {
+                        if restore {
+                            crate::core::backup::restore(&path, &settings).map(Some)
+                        } else {
+                            crate::core::backup::create(&settings, &path).map(|()| None)
+                        }
+                    })
+                    .await;
+                result.map(Some)
+            }
+            .await;
+            if let Some(panel) = weak.upgrade() {
+                let _ = panel.update(cx, |panel, cx| {
+                    panel.local_backup_busy = false;
+                    match result {
+                        Ok(Some(Some(settings))) => {
+                            let previous = panel.state.read(cx).settings.clone();
+                            let commit =
+                                settings.save_atomic_to(&crate::core::paths::config_path());
+                            match commit.and_then(|()| crate::core::settings::spawn_new_process()) {
+                                Ok(()) => {
+                                    panel.state.update(cx, |state, _| state.settings = settings);
+                                    cx.quit();
+                                }
+                                Err(error) => {
+                                    log::error!("Local restore commit/restart failed: {error}");
+                                    // A failed restart must not leave the running app pointing
+                                    // at different data on its next settings save.
+                                    if let Err(rollback) =
+                                        previous.save_atomic_to(&crate::core::paths::config_path())
+                                    {
+                                        log::error!("Restore settings rollback failed: {rollback}");
+                                    }
+                                    cx.emit(SettingsEvent::DataError(
+                                        I18nKey::LocalRestoreFailed.text().to_owned(),
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(Some(None)) => cx.emit(SettingsEvent::DataToast(
+                            I18nKey::LocalBackupDone.text().to_owned(),
+                        )),
+                        Ok(None) => {}
+                        Err(error) => {
+                            log::error!("Local backup/restore failed: {error}");
+                            cx.emit(SettingsEvent::DataError(
+                                if restore {
+                                    I18nKey::LocalRestoreFailed.text()
+                                } else {
+                                    I18nKey::LocalBackupFailed.text()
+                                }
+                                .to_owned(),
+                            ));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+    }
+
     /// Enter editing mode for the max-items field.
     fn start_edit_max_items(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.state.read(cx).settings.max_items;
@@ -102,7 +209,9 @@ impl SettingsPanel {
         // --- Snapshot current values. ---
         let app = self.state.read(cx);
         let db_path_display = app.settings.resolve_db_path();
-        let db_path_str = db_path_display.to_string_lossy().to_string();
+        let db_path_str = crate::core::paths::without_verbatim_prefix(&db_path_display)
+            .to_string_lossy()
+            .to_string();
         let maintenance_running = self.window_manager.read(cx).is_maintenance_running();
         // --- borrow released ---
 
@@ -178,13 +287,20 @@ impl SettingsPanel {
                                 .cursor(CursorStyle::PointingHand)
                                 .hover(move |s| s.opacity(0.85))
                                 .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
+                                    let dialog_guard = this
+                                        .read(_cx)
+                                        .window_manager
+                                        .read(_cx)
+                                        .suspend_auto_hide_for_dialog();
                                     let dialog = rfd::AsyncFileDialog::new()
                                         .set_file_name("clippi.db")
                                         .save_file();
                                     let state = state.clone();
                                     let task_panel = this.clone();
                                     let task = _cx.spawn(async move |cx| {
-                                        let Some(new_path) = dialog.await else {
+                                        let selected = dialog.await;
+                                        drop(dialog_guard);
+                                        let Some(new_path) = selected else {
                                             return;
                                         };
                                         let new_path = new_path.path().to_path_buf();
@@ -275,6 +391,34 @@ impl SettingsPanel {
         .into_any_element()];
         container =
             container.child(self.settings_group(I18nKey::GroupStorage.text(), storage_rows));
+
+        let busy = self.local_backup_busy || maintenance_running;
+        let backup_panel = this.clone();
+        let backup_row = div()
+            .opacity(if busy { 0.55 } else { 1.0 })
+            .child(self.setting_row_with_options(
+                I18nKey::GroupLocalBackup.text(),
+                if self.local_backup_busy {
+                    I18nKey::LocalBackupBusy.text()
+                } else {
+                    I18nKey::DescLocalBackup.text()
+                },
+                &[
+                    ("backup", I18nKey::BtnLocalBackup.text()),
+                    ("restore", I18nKey::BtnLocalRestore.text()),
+                ],
+                "backup",
+                move |key, _, cx| {
+                    if !busy {
+                        backup_panel.update(cx, |panel, cx| {
+                            panel.start_local_backup(key == "restore", cx)
+                        });
+                    }
+                },
+            ))
+            .into_any_element();
+        container = container
+            .child(self.settings_group(I18nKey::GroupLocalBackup.text(), vec![backup_row]));
 
         // --- Retention ---
         let retention_rows: Vec<AnyElement> = vec![{

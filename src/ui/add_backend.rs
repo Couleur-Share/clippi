@@ -414,9 +414,16 @@ impl AddBackendPanel {
                                 move |_ev, window, cx| {
                                     let input = folder_input.clone();
                                     let window_handle = window.window_handle();
+                                    let dialog_guard = this
+                                        .read(cx)
+                                        .window_manager
+                                        .read(cx)
+                                        .suspend_auto_hide_for_dialog();
                                     let dialog = rfd::AsyncFileDialog::new().pick_folder();
                                     let task = cx.spawn(async move |cx| {
-                                        if let Some(path) = dialog.await {
+                                        let selected = dialog.await;
+                                        drop(dialog_guard);
+                                        if let Some(path) = selected {
                                             let path = path.path().to_string_lossy().to_string();
                                             let _ =
                                                 cx.update_window(window_handle, |_, window, cx| {

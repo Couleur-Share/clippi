@@ -10,6 +10,30 @@ const APP_DIR_NAME: &str = "Clippi";
 const CONFIG_FILE: &str = "clippi.toml";
 const DB_FILE: &str = "clippi.db";
 
+/// Convert Windows canonical drive/UNC paths to ordinary user-facing paths.
+/// Leave device and volume namespaces intact rather than changing their meaning.
+pub fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        if let Some(text) = path.to_str() {
+            match prefix.kind() {
+                std::path::Prefix::VerbatimDisk(_) => {
+                    if let Some(rest) = text.strip_prefix(r"\\?\") {
+                        return PathBuf::from(rest);
+                    }
+                }
+                std::path::Prefix::VerbatimUNC(_, _) => {
+                    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                        return PathBuf::from(format!(r"\\{rest}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Cached portable-mode flag — true when the exe directory is writable.
 static IS_PORTABLE: AtomicBool = AtomicBool::new(false);
 
@@ -475,6 +499,23 @@ fn copy_dir_recursive_missing(src: &Path, dst: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{migrate_legacy_files_from, CONFIG_FILE, DB_FILE};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn canonical_prefix_normalization_preserves_drive_unc_and_device_paths() {
+        use super::without_verbatim_prefix;
+        use std::path::{Path, PathBuf};
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\G:\Clippi\clippi.db")),
+            PathBuf::from(r"G:\Clippi\clippi.db")
+        );
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\UNC\server\share\clippi.db")),
+            PathBuf::from(r"\\server\share\clippi.db")
+        );
+        let device = Path::new(r"\\?\Volume{123}\clippi.db");
+        assert_eq!(without_verbatim_prefix(device), device);
+    }
 
     #[test]
     fn legacy_migration_copies_missing_data_when_config_already_exists() {

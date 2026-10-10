@@ -132,14 +132,16 @@ impl RenderOnce for Toast {
             );
         }
 
-        left = left.child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .text_size(fs(12.))
-                .text_color(text_color)
-                .child(self.message),
-        );
+        let mut message = div()
+            .flex_1()
+            .min_w(px(0.))
+            .text_size(fs(12.))
+            .text_color(text_color)
+            .child(self.message);
+        if !has_actions {
+            message = message.text_align(TextAlign::Center);
+        }
+        left = left.child(message);
 
         row = row.child(left);
 
