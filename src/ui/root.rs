@@ -965,6 +965,9 @@ impl Render for RootView {
         let app_blacklist_popup_visible =
             is_settings && active_settings_tab == 1 && app_blacklist_popup_open;
         let latest_hotkeys_popup_visible = is_settings && latest_hotkeys_popup_open;
+        let privacy_popup_visible = is_settings
+            && active_settings_tab == 1
+            && self.settings_panel.read(cx).privacy_types_popup_open;
         let transfer_refreshing = is_clipboard && {
             let state = self.state.read(cx);
             state.transfer_filter_active && state.transfer_refreshing
@@ -1019,6 +1022,10 @@ impl Render for RootView {
             self.overlay_generation("app-blacklist-popup", app_blacklist_popup_visible);
         let latest_hotkeys_popup_gen =
             self.overlay_generation("latest-hotkeys-popup", latest_hotkeys_popup_visible);
+
+        let privacy_popup_gen =
+            self.overlay_generation("privacy-types-popup", privacy_popup_visible);
+        let privacy_popup_animating = self.overlay_animating("privacy-types-popup");
 
         let tag_panel_animating = self.overlay_animating("tag-filter");
         let filter_config_animating = self.overlay_animating("type-filter-config");
@@ -1280,6 +1287,18 @@ impl Render for RootView {
             }
         }
 
+        let privacy_popup_layout = if privacy_popup_visible && privacy_popup_animating {
+            (
+                Self::overlay_opacity(window, cx, privacy_popup_gen, "privacy-types-popup"),
+                Self::overlay_scale(window, cx, privacy_popup_gen, "privacy-types-popup"),
+                Self::overlay_offset(window, cx, privacy_popup_gen, "privacy-types-popup"),
+                win_w,
+                win_h,
+            )
+        } else {
+            (1., 1., 0., win_w, win_h)
+        };
+
         let sidebar_for_escape = self.sidebar.clone();
         let filter_config_for_escape = self.type_filter_config_panel.clone();
         let root_focus = self.focus_handle.clone();
@@ -1321,6 +1340,12 @@ impl Render for RootView {
                     // Close the innermost overlay first, then go back to clipboard
                     if root_settings.read(cx).font_picker_open {
                         root_settings.update(cx, |panel, cx| panel.close_font_picker(cx));
+                    } else if root_settings.read(cx).app_list_popup_open() {
+                        root_settings.update(cx, |panel, cx| {
+                            panel.close_app_list_popups();
+                            panel.latest_hotkeys_popup_open = false;
+                            cx.notify();
+                        });
                     } else if root_backend.read(cx).is_visible() {
                         root_backend.update(cx, |panel, cx| panel.close(cx));
                     } else {
@@ -1433,14 +1458,7 @@ impl Render for RootView {
             .when(tag_panel_visible, |root| {
                 let search_for_backdrop = filter_bar.clone();
                 root.child(
-                    div()
-                        .absolute()
-                        .left(px(36.))
-                        .right(px(0.))
-                        .top(px(0.))
-                        .bottom(px(0.))
-                        .occlude()
-                        .bg(rgba(0x00000033))
+                    crate::ui::components::modal_overlay::modal_overlay(36.)
                         .rounded(px(12.))
                         .opacity(tag_panel_opacity)
                         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
@@ -1461,14 +1479,7 @@ impl Render for RootView {
                 let search_for_backdrop = filter_bar.clone();
                 let config_panel = self.type_filter_config_panel.clone();
                 root.child(
-                    div()
-                        .absolute()
-                        .left(px(36.))
-                        .right(px(0.))
-                        .top(px(0.))
-                        .bottom(px(0.))
-                        .occlude()
-                        .bg(rgba(0x00000033))
+                    crate::ui::components::modal_overlay::modal_overlay(36.)
                         .rounded(px(12.))
                         .opacity(filter_config_opacity)
                         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
@@ -1493,13 +1504,7 @@ impl Render for RootView {
                 let tag_filter = self.tag_filter_panel.clone();
 
                 root.child(
-                    div()
-                        .absolute()
-                        .left(px(36.))
-                        .right(px(0.))
-                        .top(px(0.))
-                        .bottom(px(0.))
-                        .bg(rgba(0x00000033))
+                    crate::ui::components::modal_overlay::modal_overlay(36.)
                         .rounded(px(12.))
                         .opacity(edit_tag_opacity)
                         .flex()
@@ -1552,13 +1557,7 @@ impl Render for RootView {
 
                 // --- Backdrop — click / scroll to dismiss ---
                 root.child(
-                    div()
-                        .absolute()
-                        .left(px(36.))
-                        .right(px(0.))
-                        .top(px(0.))
-                        .bottom(px(0.))
-                        .occlude()
+                    crate::ui::components::modal_overlay::modal_overlay(36.)
                         .on_mouse_down(MouseButton::Left, {
                             let l = list.clone();
                             move |_ev, _window, cx| {
@@ -1698,14 +1697,7 @@ impl Render for RootView {
                 let clamped_y = base_y + tag_picker_offset;
 
                 root.child(
-                    div()
-                        .absolute()
-                        .left(px(36.))
-                        .right(px(0.))
-                        .top(px(0.))
-                        .bottom(px(0.))
-                        .occlude()
-                        .bg(rgba(0x00000033))
+                    crate::ui::components::modal_overlay::modal_overlay(36.)
                         .rounded(px(12.))
                         .opacity(tag_picker_opacity)
                         .on_mouse_down(MouseButton::Left, {
@@ -1998,6 +1990,8 @@ impl Render for RootView {
                 let add_button_label = (!foreground_app.is_empty())
                     .then(|| I18nKey::ClipboardAppBlacklistAddLabel.fmt(&[&foreground_app]));
                 root.child(render_app_list_dialog(AppListDialogParams {
+                    custom_rows: None,
+                    configured_count: None,
                     title: I18nKey::HotkeyBlacklist.text().to_string(),
                     empty_hint: I18nKey::HotkeyBlacklistEmptyHint.text().to_string(),
                     entries,
@@ -2092,6 +2086,8 @@ impl Render for RootView {
                         .then(|| I18nKey::ClipboardAppBlacklistAddLabel.fmt(&[&foreground_app]))
                 };
                 root.child(render_app_list_dialog(AppListDialogParams {
+                    custom_rows: None,
+                    configured_count: None,
                     title: I18nKey::HotkeyPasteShortcut.text().to_string(),
                     empty_hint: I18nKey::HotkeyPasteShortcutEmptyHint.text().to_string(),
                     entries,
@@ -2204,6 +2200,8 @@ impl Render for RootView {
                 let add_button_label = (!foreground_app.is_empty())
                     .then(|| I18nKey::ClipboardAppBlacklistAddLabel.fmt(&[&foreground_app]));
                 root.child(render_app_list_dialog(AppListDialogParams {
+                    custom_rows: None,
+                    configured_count: None,
                     title: I18nKey::ClipboardAppBlacklistTitle.text().to_string(),
                     empty_hint: I18nKey::ClipboardAppBlacklistEmptyHint.text().to_string(),
                     entries,
@@ -2270,6 +2268,55 @@ impl Render for RootView {
                             }
                         }) as Rc<dyn Fn(&mut Window, &mut App)>
                     }),
+                }))
+            })
+            .when(privacy_popup_visible, |root| {
+                let selected = self.state.read(cx).settings.privacy_protection_types.clone();
+                let theme = self.theme.clone();
+                let hover = theme.btn_hover;
+                let rows = [
+                    ("secret", "\u{e612}", I18nKey::PrivacySecret),
+                    ("phone", "\u{e966}", I18nKey::PrivacyPhone),
+                    ("email", "\u{e604}", I18nKey::PrivacyEmail),
+                    ("link", "\u{e6d7}", I18nKey::PrivacyLink),
+                ].into_iter().map(|(kind, icon, label)| {
+                    let checked = selected.iter().any(|value| value == kind);
+                    let state = self.state.clone();
+                    let panel = self.settings_panel.clone();
+                    crate::ui::type_filter_config::selectable_type_row(icon, label.text().to_string(), checked, &theme)
+                        .id(SharedString::from(format!("privacy-type-{kind}")))
+                        .h(px(32. * privacy_popup_layout.1))
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |style| style.bg(hover))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            state.update(cx, |state, cx| { state.toggle_privacy_protection_type(kind); cx.notify(); });
+                            panel.update(cx, |_, cx| cx.notify());
+                        }).into_any_element()
+                }).collect();
+                let settings = self.settings_panel.clone();
+                root.child(render_app_list_dialog(AppListDialogParams {
+                    title: I18nKey::PrivacyTypes.text().to_string(),
+                    empty_hint: String::new(),
+                    entries: Vec::new(),
+                    custom_rows: Some(rows),
+                    configured_count: Some(["secret", "phone", "email", "link"].into_iter()
+                        .filter(|kind| selected.iter().any(|value| value == kind)).count()),
+                    scroll_key: "privacy-types-popup",
+                    recording_app: None,
+                    show_shortcut_column: false,
+                    help_text: Some(I18nKey::PrivacyTypesHint.text().to_string()),
+                    add_button_label: None,
+                    add_button_recording: false,
+                    theme,
+                    layout: privacy_popup_layout,
+                    on_close: Rc::new(move |_, cx| {
+                        settings.update(cx, |panel, cx| { panel.close_app_list_popups(); cx.notify(); });
+                    }),
+                    on_delete: Rc::new(|_, _, _| {}),
+                    on_shortcut_click: None,
+                    on_cancel_recording: None,
+                    on_add: None,
                 }))
             })
             // --- Root-level clear-data ConfirmDialog ---

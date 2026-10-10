@@ -18,6 +18,13 @@ define_i18n! {
     TrayCheckUpdate:    ("检查更新", "Check for Updates"),
 
     // ─── Settings window ───
+    PrivacyTypes: ("隐私保护类型", "Privacy protection types"),
+    PrivacyTypesDesc: ("已保护 {0} 类内容 · 点击选择", "Protecting {0} types · Click to choose"),
+    PrivacyTypesHint: ("仅隐藏预览中的敏感内容，复制和粘贴保留原文", "Hide sensitive preview content; copying and pasting preserve the original"),
+    PrivacySecret: ("密钥与令牌", "Keys and tokens"),
+    PrivacyPhone: ("电话号码", "Phone numbers"),
+    PrivacyEmail: ("电子邮箱", "Email addresses"),
+    PrivacyLink: ("链接中的凭据", "Credentials in links"),
     SettingsTitle:      ("设置", "Settings"),
 
     // ─── Settings tabs ───

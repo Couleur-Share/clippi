@@ -670,10 +670,7 @@ impl Render for AddBackendPanel {
             1.0
         };
 
-        div()
-            .absolute()
-            .size_full()
-            .bg(rgba(0x00000033))
+        crate::ui::components::modal_overlay::modal_overlay(0.)
             .rounded(px(12.))
             .flex()
             .items_center()

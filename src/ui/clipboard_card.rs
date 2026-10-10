@@ -1267,6 +1267,7 @@ pub struct ClipboardCard {
     on_hotkey_format_change: Option<CardFormatHandler>,
     show_source_app: bool,
     show_original_on_hover: bool,
+    privacy_types: Vec<String>,
     /// When true and a link item has a cached page title, show the title
     /// instead of the URL path in the card content area.
     show_page_title: bool,
@@ -1300,6 +1301,7 @@ impl ClipboardCard {
             on_hotkey_format_change: None,
             show_source_app: false,
             show_original_on_hover: false,
+            privacy_types: crate::core::settings::default_privacy_types(),
             show_page_title: false,
             source_is_uploading: false,
             image_cache: None,
@@ -1403,6 +1405,11 @@ impl ClipboardCard {
         self
     }
 
+    pub fn privacy_types(mut self, types: Vec<String>) -> Self {
+        self.privacy_types = types;
+        self
+    }
+
     pub fn show_original_on_hover(mut self, value: bool) -> Self {
         self.show_original_on_hover = value;
         self
@@ -1448,6 +1455,7 @@ impl RenderOnce for ClipboardCard {
             on_commit_note,
             show_source_app,
             show_original_on_hover,
+            privacy_types,
             show_page_title,
             source_is_uploading,
             image_cache,
@@ -2146,8 +2154,11 @@ impl RenderOnce for ClipboardCard {
             } else if matches!(content_kind, DisplayKind::Link | DisplayKind::Path) {
                 if matches!(content_kind, DisplayKind::Link) {
                     let domain = url_domain(full_text);
-                    let masked_url =
-                        crate::core::secret::sensitive_preview_to_text(full_text, "link");
+                    let masked_url = crate::core::secret::sensitive_preview_to_text_with_types(
+                        full_text,
+                        "link",
+                        &privacy_types,
+                    );
                     let path = url_path(&masked_url);
 
                     // When page-title fetching is enabled and a title is cached,
@@ -2242,7 +2253,11 @@ impl RenderOnce for ClipboardCard {
                 content_kind,
                 DisplayKind::Email | DisplayKind::Phone | DisplayKind::Secret,
             ) {
-                let parts = crate::core::secret::sensitive_preview_parts(full_text, &meta_type);
+                let parts = crate::core::secret::sensitive_preview_parts_with_types(
+                    full_text,
+                    &meta_type,
+                    &privacy_types,
+                );
                 div().flex_1().flex().items_center().child(
                     SensitiveText::new(parts)
                         .search_terms(search_terms.clone())

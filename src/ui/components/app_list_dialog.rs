@@ -45,6 +45,10 @@ pub struct AppListDialogParams {
     pub title: String,
     pub empty_hint: String,
     pub entries: Vec<AppListDialogEntry>,
+    /// Custom selectable rows use the same shell, geometry and animation.
+    pub custom_rows: Option<Vec<AnyElement>>,
+    /// Override the badge without changing the number of rows or dialog geometry.
+    pub configured_count: Option<usize>,
     /// Stable key for the entry list's scroll state. Must be unique per
     /// dialog instance so the three app-list popups never share or leak
     /// scroll offsets into one another.
@@ -131,7 +135,10 @@ impl RenderOnce for AppListScrollArea {
 pub fn render_app_list_dialog(params: AppListDialogParams) -> impl IntoElement {
     let (opacity, scale, offset, viewport_width, viewport_height) = params.layout;
     let popup_width = DIALOG_WIDTH * scale;
-    let entry_count = params.entries.len();
+    let entry_count = params
+        .custom_rows
+        .as_ref()
+        .map_or(params.entries.len(), Vec::len);
     let visible_entries = entry_count.min(MAX_VISIBLE_ENTRIES);
     let has_add = params.add_button_label.is_some() && params.on_add.is_some();
     let list_content_height = if entry_count == 0 {
@@ -172,13 +179,7 @@ pub fn render_app_list_dialog(params: AppListDialogParams) -> impl IntoElement {
         theme.surface_press
     };
 
-    div()
-        .absolute()
-        .left(px(36.))
-        .right(px(0.))
-        .top(px(0.))
-        .bottom(px(0.))
-        .bg(rgba(0x00000033))
+    crate::ui::components::modal_overlay::modal_overlay(36.)
         .rounded(px(12.))
         .opacity(opacity)
         .cursor(CursorStyle::PointingHand)
@@ -211,7 +212,7 @@ pub fn render_app_list_dialog(params: AppListDialogParams) -> impl IntoElement {
                 // ── Title bar ──
                 .child(render_title_bar(
                     &params.title,
-                    entry_count,
+                    params.configured_count.unwrap_or(entry_count),
                     &theme,
                     scale,
                     params.help_text.clone(),
@@ -221,7 +222,9 @@ pub fn render_app_list_dialog(params: AppListDialogParams) -> impl IntoElement {
                 // ── Entry list or empty hint ──
                 .child(AppListScrollArea {
                     key: params.scroll_key,
-                    children: if entry_count == 0 {
+                    children: if let Some(rows) = params.custom_rows {
+                        rows
+                    } else if entry_count == 0 {
                         vec![div()
                             .flex_1()
                             .min_h(px(EMPTY_LIST_HEIGHT * scale))

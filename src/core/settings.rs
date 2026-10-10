@@ -183,6 +183,8 @@ pub struct AppSettings {
     pub record_images: bool,
     #[serde(default = "default_record_clipboard_content")]
     pub record_files: bool,
+    #[serde(default = "default_privacy_types")]
+    pub privacy_protection_types: Vec<String>,
     #[serde(default)]
     pub language: String, // "zh_CN" or "en", empty = follow system
     #[serde(default)]
@@ -369,6 +371,7 @@ impl Default for AppSettings {
             clipboard_app_blacklist: Vec::new(),
             record_images: true,
             record_files: true,
+            privacy_protection_types: default_privacy_types(),
             language: String::new(),
             pinned_tag_ids: Vec::new(),
             tag_order: Vec::new(),
@@ -2235,5 +2238,33 @@ mod tests {
             AutoStartMethod::UserSession | AutoStartMethod::ElevatedTask
         ));
         assert!(!is_process_elevated() || method == AutoStartMethod::ElevatedTask);
+    }
+}
+
+/// Keep existing masking enabled when loading older settings; an empty list disables it.
+pub fn default_privacy_types() -> Vec<String> {
+    ["secret", "phone", "email", "link"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_keep_masking_and_empty_selection_round_trips() {
+        let mut settings = AppSettings::default();
+        let mut value = toml::Value::try_from(&settings).unwrap();
+        value
+            .as_table_mut()
+            .unwrap()
+            .remove("privacy_protection_types");
+        let old: AppSettings = value.try_into().unwrap();
+        assert_eq!(old.privacy_protection_types, default_privacy_types());
+        settings.privacy_protection_types.clear();
+        let loaded: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert!(loaded.privacy_protection_types.is_empty());
     }
 }

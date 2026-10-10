@@ -92,6 +92,7 @@ pub struct SettingsPanel {
     pub hotkey_blacklist_popup_open: bool,
     pub paste_shortcuts_popup_open: bool,
     pub app_blacklist_popup_open: bool,
+    pub privacy_types_popup_open: bool,
     /// Pending hotkey blacklist confirmation (consumed by RootView).
     pub hotkey_confirm: Option<HotkeyConfirmAction>,
     /// Whether we are currently recording a paste shortcut for an app (Some(app_name)).
@@ -236,6 +237,7 @@ impl SettingsPanel {
             hotkey_blacklist_popup_open: false,
             paste_shortcuts_popup_open: false,
             app_blacklist_popup_open: false,
+            privacy_types_popup_open: false,
             hotkey_confirm: None,
             recording_paste_shortcut: None,
             pending_paste_shortcut: None,
@@ -285,10 +287,19 @@ impl SettingsPanel {
         self.active_tab
     }
 
+    pub fn app_list_popup_open(&self) -> bool {
+        self.privacy_types_popup_open
+            || self.app_blacklist_popup_open
+            || self.hotkey_blacklist_popup_open
+            || self.paste_shortcuts_popup_open
+            || self.latest_hotkeys_popup_open
+    }
+
     pub fn close_app_list_popups(&mut self) {
         self.hotkey_blacklist_popup_open = false;
         self.paste_shortcuts_popup_open = false;
         self.app_blacklist_popup_open = false;
+        self.privacy_types_popup_open = false;
     }
 
     pub fn toggle_hotkey_blacklist_popup(&mut self) {
@@ -1428,13 +1439,8 @@ impl SettingsPanel {
         )
         .collect();
 
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
+        crate::ui::components::modal_overlay::modal_overlay(0.)
             .p(px(16.))
-            .bg(rgba(0x00000070))
             .flex()
             .items_center()
             .justify_center()

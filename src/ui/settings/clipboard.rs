@@ -553,6 +553,28 @@ impl SettingsPanel {
 
         // --- Filtering ---
         let filter_rows: Vec<AnyElement> = vec![
+            {
+                let this = this.clone();
+                let selected = &self.state.read(cx).settings.privacy_protection_types;
+                let count = ["secret", "phone", "email", "link"]
+                    .into_iter()
+                    .filter(|kind| selected.iter().any(|value| value == kind))
+                    .count();
+                self.setting_row_opener(
+                    I18nKey::PrivacyTypes.text(),
+                    &I18nKey::PrivacyTypesDesc.fmt(&[&count.to_string()]),
+                    move |_window, cx| {
+                        this.update(cx, |panel, cx| {
+                            let open = !panel.privacy_types_popup_open;
+                            panel.close_app_list_popups();
+                            panel.latest_hotkeys_popup_open = false;
+                            panel.privacy_types_popup_open = open;
+                            cx.notify();
+                        });
+                    },
+                )
+                .into_any_element()
+            },
             self.render_toggle_row(
                 I18nKey::SettingFilterForeignPaths,
                 I18nKey::DescFilterForeignPathsOn,

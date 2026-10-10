@@ -2896,6 +2896,7 @@ impl Render for ClipboardListView {
                                                     .theme(theme.clone())
                                                     .hovered(is_hovered)
                                                     .show_source_app(show_source_app)
+                                                    .privacy_types(this.state.read(cx).settings.privacy_protection_types.clone())
                                                     .show_original_on_hover(show_original_on_hover)
                                                     .show_page_title(show_page_title)
                                                     .source_is_uploading(source_is_uploading)

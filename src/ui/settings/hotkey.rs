@@ -440,13 +440,7 @@ impl SettingsPanel {
             .count();
         let close_panel = panel_entity.clone();
 
-        div()
-            .absolute()
-            .left(px(36.))
-            .right(px(0.))
-            .top(px(0.))
-            .bottom(px(0.))
-            .bg(rgba(0x00000033))
+        crate::ui::components::modal_overlay::modal_overlay(36.)
             .rounded(px(12.))
             .opacity(opacity)
             .cursor(CursorStyle::PointingHand)

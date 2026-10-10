@@ -967,6 +967,7 @@ fn editor_box(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_rich_preview(
     selected_type: &str,
     text: &str,

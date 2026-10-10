@@ -10,7 +10,7 @@ use gpui::{InteractiveElement, StatefulInteractiveElement};
 use super::rich_preview;
 use super::search_highlight;
 use crate::core::color::detect_color;
-use crate::core::secret::sensitive_preview_to_text;
+use crate::core::secret::sensitive_preview_to_text_with_types;
 use crate::core::types::{
     format_relative_time, path_is_native, url_domain, url_path, url_site_name, ClipboardItem,
     ContentType, DisplayKind, FileData, RichData,
@@ -768,7 +768,11 @@ impl QuickPasteView {
                 } else {
                     None
                 };
-                let (preview_label, preview_subtitle) = preview_parts(item, auto_fetch_title);
+                let (preview_label, preview_subtitle) = preview_parts(
+                    item,
+                    auto_fetch_title,
+                    &state.settings.privacy_protection_types,
+                );
                 // File icon cache path for file-type items
                 let file_icon_path = if item.content_type == ContentType::File
                     && remote_host.is_none()
@@ -2052,7 +2056,11 @@ fn styled_preview(item: &ClipboardItem) -> Option<Vec<rich_preview::StyledHtmlSp
     lines.into_iter().next()
 }
 
-fn preview_parts(item: &ClipboardItem, auto_fetch_title: bool) -> (String, Option<String>) {
+fn preview_parts(
+    item: &ClipboardItem,
+    auto_fetch_title: bool,
+    privacy_types: &[String],
+) -> (String, Option<String>) {
     let remote_host = RichData::from_json(&item.rich_data).remote_host;
     let raw = match item.content_type {
         ContentType::Image => {
@@ -2090,7 +2098,8 @@ fn preview_parts(item: &ClipboardItem, auto_fetch_title: bool) -> (String, Optio
         _ => {
             // ── URL: site name + page title (or domain + path fallback) ──
             if item.meta_type == "link" {
-                let masked_url = sensitive_preview_to_text(&item.full_text, "link");
+                let masked_url =
+                    sensitive_preview_to_text_with_types(&item.full_text, "link", privacy_types);
                 let domain = url_domain(&item.full_text);
                 let path = url_path(&masked_url);
                 if auto_fetch_title {
@@ -2136,7 +2145,7 @@ fn preview_parts(item: &ClipboardItem, auto_fetch_title: bool) -> (String, Optio
         s
     };
     // Mask sensitive content (email / phone / secret) in preview
-    let masked = sensitive_preview_to_text(&raw, &item.meta_type);
+    let masked = sensitive_preview_to_text_with_types(&raw, &item.meta_type, privacy_types);
     (masked, None)
 }
 

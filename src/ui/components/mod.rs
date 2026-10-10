@@ -3,6 +3,7 @@
 
 pub mod app_list_dialog;
 pub mod confirm_dialog;
+pub mod modal_overlay;
 pub mod reorder;
 pub mod sensitive_text;
 pub mod slider;

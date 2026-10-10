@@ -1144,9 +1144,7 @@ impl SettingsPanel {
 
         let this = cx.entity().clone();
 
-        div()
-            .absolute()
-            .size_full()
+        crate::ui::components::modal_overlay::modal_overlay(0.)
             .flex()
             .items_center()
             .justify_center()

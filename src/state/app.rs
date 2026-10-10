@@ -398,6 +398,20 @@ fn dedupe_ids(ids: &[i64]) -> Vec<i64> {
 }
 
 impl AppState {
+    /// Privacy choices affect previews only; persisted clipboard contents remain intact.
+    pub fn toggle_privacy_protection_type(&mut self, kind: &str) {
+        if !["secret", "phone", "email", "link"].contains(&kind) {
+            return;
+        }
+        let types = &mut self.settings.privacy_protection_types;
+        if types.iter().any(|value| value == kind) {
+            types.retain(|value| value != kind);
+        } else {
+            types.push(kind.to_string());
+        }
+        self.settings.save();
+    }
+
     /// Open the database and load initial data.
     pub fn new(settings: AppSettings) -> Self {
         let db_path = settings.resolve_db_path();

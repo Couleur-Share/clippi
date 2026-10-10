@@ -405,6 +405,16 @@ impl Render for TypeFilterConfigPanel {
 /// Passive row visuals shared with the drag preview; interaction stays on the live row.
 fn filter_row(key: &str, visible: bool, theme: &ClippiTheme) -> Div {
     let (icon, label) = filter_type_display(key).unwrap_or(("\u{e606}", key.to_string()));
+    selectable_type_row(icon, label, visible, theme)
+}
+
+/// Shared visuals for type choices; callers supply interaction.
+pub(crate) fn selectable_type_row(
+    icon: &str,
+    label: String,
+    visible: bool,
+    theme: &ClippiTheme,
+) -> Div {
     div()
         .w_full()
         .flex()

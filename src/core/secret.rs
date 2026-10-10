@@ -1,4 +1,4 @@
-//! Secret (password / API key / token / private key) detection and
+//! Conservative secret (API key / token / private key) detection and
 //! unified sensitive-content masking for display.
 //!
 //! Detection is a deterministic pure function. Masking produces structured
@@ -10,7 +10,6 @@
 //! Never log the original text, prefix, suffix, or matched values.  Logs may
 //! contain only the rule name, text length, and error category.
 
-use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -19,7 +18,7 @@ use regex::Regex;
 /// Increment when detection rules change.  Used to invalidate preview caches
 /// and to gate one-shot historical backfill.
 #[allow(dead_code)]
-pub const SECRET_DETECTION_RULE_VERSION: u16 = 1;
+pub const SECRET_DETECTION_RULE_VERSION: u16 = 2;
 
 // ── Detection result types ──────────────────────────────────────────────────
 
@@ -38,7 +37,6 @@ pub enum SecretKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretConfidence {
     High,
-    Medium,
 }
 
 /// One or more sensitive value ranges found in `text`.
@@ -106,7 +104,7 @@ pub fn detect_secret(text: &str) -> Option<SecretMatch> {
         return Some(m);
     }
 
-    // ── 4. Field-based patterns (password=..., api_key: ..., etc.) ──────
+    // ── 4. Explicit secret fields (api_key: ..., access_token=..., etc.) ──────
     let field_matches = detect_field_secrets(text);
     if !field_matches.is_empty() {
         let kind = if text.contains("private_key") || text.contains("PRIVATE KEY") {
@@ -121,11 +119,6 @@ pub fn detect_secret(text: &str) -> Option<SecretMatch> {
             confidence: SecretConfidence::High,
             value_ranges: field_matches,
         });
-    }
-
-    // ── 5. Standalone password-like strings ────────────────────────────
-    if let Some(m) = detect_standalone_password(text) {
-        return Some(m);
     }
 
     None
@@ -172,8 +165,7 @@ static FIELD_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
         (?:export\s+)?
         ["']?
         (?P<key>
-            password|passwd|pwd|passphrase
-            |secret|client_secret
+            client_secret
             |api_key|apikey
             |access_key|secret_key
             |access_token|auth_token|refresh_token
@@ -192,12 +184,12 @@ static FIELD_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static AUTH_BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:Authorization:\s*)?Bearer\s+(?P<token>[A-Za-z0-9\-._~+/]+=*)")
+    Regex::new(r"(?im)^\s*(?:Authorization:\s*)?Bearer\s+(?P<token>[A-Za-z0-9\-._~+/]{16,}=*)\s*$")
         .expect("auth bearer regex")
 });
 
 static AUTH_BASIC_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:Authorization:\s*)?Basic\s+(?P<credentials>[A-Za-z0-9+/]+=*)")
+    Regex::new(r"(?im)^\s*(?:Authorization:\s*)?Basic\s+(?P<credentials>[A-Za-z0-9+/]{8,}=*)\s*$")
         .expect("auth basic regex")
 });
 
@@ -267,7 +259,7 @@ fn classify_known_prefix(s: &str) -> SecretKind {
     }
 }
 
-/// Quick JWT plausibility check: does the header decode to a JSON object?
+/// Require an algorithm header, an object payload and valid base64url segments.
 fn is_plausible_jwt(s: &str) -> bool {
     let parts: Vec<&str> = s.splitn(3, '.').collect();
     if parts.len() != 3 {
@@ -276,9 +268,18 @@ fn is_plausible_jwt(s: &str) -> bool {
     // Base64url-decode the header
     let header = parts[0];
     if let Ok(decoded) = base64_url_decode(header) {
-        // Minimal check: starts with '{' and contains '"'
-        let h = String::from_utf8_lossy(&decoded);
-        return h.trim_start().starts_with('{') && h.contains('"');
+        let Ok(header) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+            return false;
+        };
+        return header
+            .get("alg")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|alg| !alg.is_empty() && alg != "none")
+            && base64_url_decode(parts[1])
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|payload| payload.is_object())
+            && base64_url_decode(parts[2]).is_ok();
     }
     false
 }
@@ -309,6 +310,13 @@ fn detect_auth_header(text: &str) -> Option<SecretMatch> {
     // Basic
     if let Some(caps) = AUTH_BASIC_RE.captures(text) {
         if let Some(m) = caps.name("credentials") {
+            use base64::Engine;
+            let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(m.as_str()) else {
+                return None;
+            };
+            if !decoded.contains(&b':') {
+                return None;
+            }
             return Some(SecretMatch {
                 kind: SecretKind::Credential,
                 confidence: SecretConfidence::High,
@@ -364,277 +372,6 @@ fn is_secret_placeholder(s: &str) -> bool {
         || s.eq_ignore_ascii_case("null")
         || s.eq_ignore_ascii_case("none")
         || s.starts_with('$')
-}
-
-fn detect_standalone_password(text: &str) -> Option<SecretMatch> {
-    let t = text.trim();
-    // Must be single-line, no internal whitespace
-    let value_start = text.find(t)?;
-    if t.contains('\n') || t.contains('\r') || t.contains(' ') || t.contains('\t') {
-        return None;
-    }
-    let char_count = t.chars().count();
-    if !(12..=256).contains(&char_count) {
-        return None;
-    }
-    // Character class diversity
-    let has_upper = t.chars().any(|c| c.is_uppercase());
-    let has_lower = t.chars().any(|c| c.is_lowercase());
-    let has_digit = t.chars().any(|c| c.is_ascii_digit());
-    let has_symbol = t
-        .chars()
-        .any(|c| c.is_ascii_punctuation() && c != '_' && c != '-');
-    let class_count = [has_upper, has_lower, has_digit, has_symbol]
-        .iter()
-        .filter(|&&x| x)
-        .count();
-    if class_count < 3 {
-        return None;
-    }
-    // Reject known non-secret patterns
-    if looks_like_url(t)
-        || looks_like_email(t)
-        || looks_like_phone(t)
-        || looks_like_hash(t)
-        || looks_like_uuid(t)
-        || is_repeating(t)
-        || looks_like_file_path(t)
-    {
-        return None;
-    }
-    // Simple entropy check: unique chars / total chars
-    let unique: HashSet<char> = t.chars().collect();
-    let entropy_ratio = unique.len() as f64 / char_count as f64;
-    if entropy_ratio < 0.3 {
-        return None;
-    }
-
-    #[allow(clippy::single_range_in_vec_init)]
-    Some(SecretMatch {
-        kind: SecretKind::Password,
-        confidence: SecretConfidence::Medium,
-        value_ranges: vec![value_start..value_start + t.len()],
-    })
-}
-
-fn looks_like_url(s: &str) -> bool {
-    s.starts_with("http://")
-        || s.starts_with("https://")
-        || s.starts_with("ftp://")
-        || s.starts_with("sftp://")
-        || s.contains("://")
-        || s.starts_with("www.")
-}
-
-fn looks_like_email(s: &str) -> bool {
-    s.contains('@') && s.contains('.')
-}
-
-fn looks_like_phone(s: &str) -> bool {
-    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
-    digits.len() >= 7 && digits.len() <= 15
-}
-
-fn looks_like_hash(s: &str) -> bool {
-    // Common hex hashes (MD5: 32, SHA1: 40, SHA256: 64)
-    let len = s.len();
-    if (len == 32 || len == 40 || len == 64) && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return true;
-    }
-    // Git commit SHA
-    if (len == 7 || len == 8 || len == 40) && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return true;
-    }
-    false
-}
-
-fn looks_like_uuid(s: &str) -> bool {
-    // e.g. 550e8400-e29b-41d4-a716-446655440000
-    s.len() == 36 && s.chars().filter(|&c| c == '-').count() == 4
-}
-
-fn is_repeating(s: &str) -> bool {
-    if s.len() < 4 {
-        return false;
-    }
-    let chars: Vec<char> = s.chars().collect();
-    // Check if > 50% of characters are the same
-    let mut counts = std::collections::HashMap::new();
-    for &c in &chars {
-        *counts.entry(c).or_insert(0) += 1;
-    }
-    let max_count = counts.values().max().copied().unwrap_or(0);
-    if max_count as f64 / chars.len() as f64 > 0.5 {
-        return true;
-    }
-    // Check for repeated short pattern (e.g., "abcabcabc")
-    for period in 2..=4 {
-        if chars.len().is_multiple_of(period) {
-            let pattern = &chars[..period];
-            if chars.chunks(period).all(|chunk| chunk == pattern) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Detect strings that look like file paths (Windows / Unix / UNC).
-/// Presence of directory separators (`\` or `/`) plus a file extension
-/// is a strong signal that this is not a password.
-fn looks_like_file_path(s: &str) -> bool {
-    // Markdown inline links/images wrap their destination in punctuation, so
-    // the extension is not necessarily at the end of the clipboard text.
-    // Only treat a complete inline construct as path-like; this avoids making
-    // arbitrary password punctuation a filename signal.
-    if let Some(destination) = markdown_inline_destination(s) {
-        return looks_like_file_path(destination) || looks_like_plain_filename(destination);
-    }
-
-    // Windows absolute path: C:\... or D:/...
-    if s.len() >= 3
-        && s.as_bytes()[0].is_ascii_alphabetic()
-        && s.as_bytes()[1] == b':'
-        && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/')
-    {
-        return true;
-    }
-    // UNC path: \\server\share\...
-    if s.starts_with("\\\\") {
-        return true;
-    }
-    // Unix absolute path: /abs/path (must contain another /)
-    if s.starts_with('/') && s.len() >= 3 && s[1..].contains('/') {
-        return true;
-    }
-    // Any string with directory separators and a file extension is likely a path.
-    // File extension: a period followed by 1-10 alphanumeric chars near the end.
-    if s.contains('\\') || s.contains('/') {
-        if let Some(dot) = s.rfind('.') {
-            let ext = &s[dot + 1..];
-            if !ext.is_empty() && ext.len() <= 10 && ext.chars().all(|c| c.is_ascii_alphanumeric())
-            {
-                return true;
-            }
-        }
-    }
-    looks_like_plain_filename(s)
-}
-
-/// Return the destination when the whole value is a Markdown inline link or
-/// image such as `![](./assets/photo-01.jpg)` or `[label](manual-v2.pdf)`.
-fn markdown_inline_destination(s: &str) -> Option<&str> {
-    let open = s.find("](")?;
-    if !s.ends_with(')') || !(s.starts_with("![") || s.starts_with('[')) {
-        return None;
-    }
-    let destination = &s[open + 2..s.len() - 1];
-    if destination.is_empty() || destination.contains(['(', ')']) {
-        return None;
-    }
-    Some(destination)
-}
-
-/// Recognise a bare filename without also accepting general high-entropy
-/// strings. The suffix must look like a conventional extension and the stem
-/// is limited to characters normally used in filenames.
-fn looks_like_plain_filename(s: &str) -> bool {
-    let Some((stem, ext)) = s.rsplit_once('.') else {
-        return false;
-    };
-    !stem.is_empty()
-        && (1..=10).contains(&ext.len())
-        && is_common_file_extension(ext)
-        && stem
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ' ' | '(' | ')' | '[' | ']'))
-}
-
-/// Keep the standalone-password exemption limited to extensions users
-/// commonly copy as filenames or resource references. Treating every alphabetic
-/// suffix as a file extension lets password-like values invent an arbitrary
-/// suffix solely to bypass detection.
-fn is_common_file_extension(ext: &str) -> bool {
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "txt"
-            | "md"
-            | "markdown"
-            | "rtf"
-            | "pdf"
-            | "doc"
-            | "docx"
-            | "xls"
-            | "xlsx"
-            | "ppt"
-            | "pptx"
-            | "csv"
-            | "tsv"
-            | "json"
-            | "xml"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "ini"
-            | "log"
-            | "html"
-            | "htm"
-            | "css"
-            | "js"
-            | "jsx"
-            | "ts"
-            | "tsx"
-            | "rs"
-            | "py"
-            | "java"
-            | "c"
-            | "h"
-            | "cpp"
-            | "hpp"
-            | "cs"
-            | "go"
-            | "swift"
-            | "kt"
-            | "kts"
-            | "sh"
-            | "zsh"
-            | "fish"
-            | "sql"
-            | "jpg"
-            | "jpeg"
-            | "png"
-            | "gif"
-            | "webp"
-            | "bmp"
-            | "tif"
-            | "tiff"
-            | "svg"
-            | "ico"
-            | "heic"
-            | "mp3"
-            | "wav"
-            | "flac"
-            | "m4a"
-            | "aac"
-            | "ogg"
-            | "mp4"
-            | "mov"
-            | "mkv"
-            | "avi"
-            | "webm"
-            | "zip"
-            | "rar"
-            | "7z"
-            | "tar"
-            | "gz"
-            | "bz2"
-            | "xz"
-            | "dmg"
-            | "pkg"
-            | "exe"
-            | "msi"
-            | "app"
-    )
 }
 
 fn sort_and_merge_ranges(ranges: &mut Vec<std::ops::Range<usize>>) {
@@ -805,7 +542,23 @@ pub fn mask_middle(value: &str, rule: MaskRule) -> MaskedValue {
 /// - `link`: extracts URL credential/query ranges via `url_sensitive_ranges`.
 /// - `email` / `phone`: use structured rules (not `****` parsing).
 /// - all others: single `Plain` segment.
+#[cfg(test)]
 pub fn sensitive_preview_parts(text: &str, meta_type: &str) -> Vec<SensitivePreviewPart> {
+    sensitive_preview_parts_with_types(
+        text,
+        meta_type,
+        &crate::core::settings::default_privacy_types(),
+    )
+}
+
+pub fn sensitive_preview_parts_with_types(
+    text: &str,
+    meta_type: &str,
+    types: &[String],
+) -> Vec<SensitivePreviewPart> {
+    if !types.iter().any(|kind| kind == meta_type) {
+        return vec![SensitivePreviewPart::Plain(text.to_string())];
+    }
     match meta_type {
         "secret" => {
             if let Some(secret) = rebuild_secret_preview_match(text) {
@@ -885,7 +638,16 @@ fn rebuild_secret_preview_match(text: &str) -> Option<SecretMatch> {
         return Some(secret);
     }
 
-    let value_ranges = detect_field_secrets(text);
+    let mut value_ranges = detect_field_secrets(text);
+    static LEGACY_PASSWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?im)(?:^|[,\{]\s*)["']?(?:password|passwd|pwd|passphrase)["']?\s*[:=]\s*["']?(?P<value>[^"'\r\n,}]+)"#).expect("legacy password preview regex")
+    });
+    for caps in LEGACY_PASSWORD_RE.captures_iter(text) {
+        if let Some(value) = caps.name("value") {
+            value_ranges.push(value.range());
+        }
+    }
+    sort_and_merge_ranges(&mut value_ranges);
     if !value_ranges.is_empty() {
         return Some(SecretMatch {
             kind: SecretKind::Credential,
@@ -898,9 +660,22 @@ fn rebuild_secret_preview_match(text: &str) -> Option<SecretMatch> {
 }
 
 /// Flatten structured sensitive parts for text-only preview surfaces.
+#[cfg(test)]
 pub fn sensitive_preview_to_text(text: &str, meta_type: &str) -> String {
+    sensitive_preview_to_text_with_types(
+        text,
+        meta_type,
+        &crate::core::settings::default_privacy_types(),
+    )
+}
+
+pub fn sensitive_preview_to_text_with_types(
+    text: &str,
+    meta_type: &str,
+    types: &[String],
+) -> String {
     let mut result = String::new();
-    for part in sensitive_preview_parts(text, meta_type) {
+    for part in sensitive_preview_parts_with_types(text, meta_type, types) {
         match part {
             SensitivePreviewPart::Plain(value) => result.push_str(&value),
             SensitivePreviewPart::Masked(value) => {
@@ -1201,12 +976,6 @@ mod tests {
     // ── detect_secret: field patterns ───────────────────────────────────
 
     #[test]
-    fn detect_password_field() {
-        let m = detect_secret("password=my-secret-password-123").unwrap();
-        assert_eq!(m.confidence, SecretConfidence::High);
-    }
-
-    #[test]
     fn detect_api_key_field() {
         let m = detect_secret("API_KEY=sk-abcdefghijklmnopqrstuvwx").unwrap();
         assert_eq!(m.confidence, SecretConfidence::High);
@@ -1216,8 +985,8 @@ mod tests {
     fn detect_env_file() {
         let text = "API_KEY=sk-test-key-12345\nPASSWORD=\"correct-horse-battery-staple\"\nREGION=ap-east-1";
         let m = detect_secret(text).unwrap();
-        // Should have 2 ranges (API_KEY value and PASSWORD value), not REGION
-        assert!(m.value_ranges.len() >= 2);
+        // Only the explicit API key is classified; passwords are ignored.
+        assert_eq!(m.value_ranges.len(), 1);
     }
 
     #[test]
@@ -1225,19 +994,9 @@ mod tests {
         let text = r#"{"access_token":"token-value-123","password":"abc1"}"#;
         let detected = detect_secret(text).unwrap();
         assert_eq!(detected.confidence, SecretConfidence::High);
-        assert_eq!(detected.value_ranges.len(), 2);
+        assert_eq!(detected.value_ranges.len(), 1);
         assert_eq!(&text[detected.value_ranges[0].clone()], "token-value-123");
-        assert_eq!(&text[detected.value_ranges[1].clone()], "abc1");
     }
-
-    #[test]
-    fn detect_short_and_path_like_explicit_passwords() {
-        for text in ["password=1234", r#"{"password":"a/b\\c"}"#] {
-            let detected = detect_secret(text).unwrap();
-            assert_eq!(detected.value_ranges.len(), 1);
-        }
-    }
-    // ── detect_secret: private key blocks ───────────────────────────────
 
     #[test]
     fn detect_pem_private_key() {
@@ -1255,13 +1014,6 @@ mod tests {
     }
 
     // ── detect_secret: standalone passwords ─────────────────────────────
-
-    #[test]
-    fn detect_strong_password() {
-        let m = detect_secret("C0rrect-H0rse-Battery-Staple!").unwrap();
-        assert_eq!(m.kind, SecretKind::Password);
-        assert_eq!(m.confidence, SecretConfidence::Medium);
-    }
 
     #[test]
     fn reject_short_password() {
@@ -1438,6 +1190,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn conservative_detection_and_optional_masking() {
+        for text in [
+            "与Φ14*7.6因素有关",
+            "GetClipboardData123",
+            "C0rrect-H0rse-Battery-Staple!",
+            "password=1234",
+            "Bearer of good news",
+            "secret=true",
+        ] {
+            assert!(
+                detect_secret(text).is_none(),
+                "unexpected secret classification"
+            );
+        }
+        for (kind, text) in [
+            ("phone", "13812345678"),
+            ("email", "abcdef@example.com"),
+            ("secret", "ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD"),
+            ("link", "https://example.com/?token=one-time-secret"),
+        ] {
+            assert_eq!(sensitive_preview_to_text_with_types(text, kind, &[]), text);
+            assert_ne!(
+                sensitive_preview_to_text_with_types(text, kind, &[kind.to_string()]),
+                text
+            );
+            assert_eq!(
+                sensitive_preview_to_text_with_types(text, kind, &["unrelated".to_string()]),
+                text
+            );
+        }
+    }
+
     // ── Determinism ─────────────────────────────────────────────────────
 
     #[test]
@@ -1523,11 +1308,6 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_alpha_suffix_does_not_bypass_password_detection() {
-        assert!(detect_secret("StrongPassword123.qwerty").is_some());
-    }
-
-    #[test]
     fn common_resource_extensions_are_case_insensitive() {
         for text in ["Preview-2026.JPEG", "Release_Notes.PDF", "archive-v2.TAR"] {
             assert!(
@@ -1535,39 +1315,5 @@ mod tests {
                 "common filename should not be detected as secret: {text}"
             );
         }
-    }
-
-    #[test]
-    fn looks_like_file_path_detects_windows_paths() {
-        assert!(looks_like_file_path(
-            "G:\\Develop\\github\\clippi\\RELEASES.md"
-        ));
-        assert!(looks_like_file_path("C:\\Windows\\System32\\cmd.exe"));
-        assert!(looks_like_file_path("D:/data/images/photo.png"));
-    }
-
-    #[test]
-    fn looks_like_file_path_detects_unc() {
-        assert!(looks_like_file_path("\\\\server\\share\\folder"));
-        assert!(looks_like_file_path("\\\\192.168.1.1\\data\\file.bin"));
-    }
-
-    #[test]
-    fn looks_like_file_path_detects_unix_paths() {
-        assert!(looks_like_file_path("/usr/bin/gcc"));
-        assert!(looks_like_file_path("/home/user/.config/app/config.toml"));
-    }
-
-    #[test]
-    fn looks_like_file_path_rejects_non_paths() {
-        assert!(!looks_like_file_path("C0rrect-H0rse-Battery-Staple!"));
-        assert!(!looks_like_file_path(
-            "sk-proj-test-abcdefghijklmnopqrstuvwxyz1234567890AB"
-        ));
-        assert!(!looks_like_file_path(
-            "ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD"
-        ));
-        // Forward slash but no file extension — may be ambiguous
-        assert!(!looks_like_file_path("usr/local/bin"));
     }
 }
