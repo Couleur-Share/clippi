@@ -2,6 +2,11 @@
 //!
 //! Page titles live in `rich_data` and sync across devices. Favicons are local
 //! cache files, so every device should fetch its own copy when a link appears.
+//!
+//! Every favicon and title request is queued onto background workers: clipboard
+//! detection never performs network I/O. A newly published favicon file asks
+//! the UI for a repaint (`favicon::take_favicon_ready`) instead of rewriting the
+//! stored item, which holds no favicon data.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -77,7 +82,7 @@ fn submit(job: UrlAssetJob) {
 fn run_job(job: UrlAssetJob) {
     match job {
         UrlAssetJob::Favicon { url } => {
-            ensure_url_favicon_cached(&url);
+            cache_favicon_for_user_requested_link(&url);
         }
         UrlAssetJob::Title {
             url,
@@ -116,6 +121,31 @@ fn run_job(job: UrlAssetJob) {
     }
 }
 
+/// Cache the favicon of a link the user just captured or wrote by hand, and
+/// report a fetch that could not produce an icon.
+///
+/// The warning is the only visible trace of a favicon service that is slow or
+/// unreachable — the condition is otherwise silent, and it is exactly the one
+/// that makes a link's icon appear seconds late. It stays on the per-capture /
+/// per-edit path so the bulk backfill cannot flood the log with it.
+fn cache_favicon_for_user_requested_link(url: &str) {
+    let domain = url_to_domain(url);
+    if domain.is_empty() {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    if ensure_url_favicon_cached(url) {
+        return;
+    }
+    if crate::services::favicon::favicon_cache_path(&domain).is_none() {
+        log::warn!(
+            "url_assets: no favicon for {domain} after {}ms",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
 /// Ensure the favicon for `url` exists in the local disk cache.
 /// Returns `true` only when this call created a previously missing cache file.
 pub fn ensure_url_favicon_cached(url: &str) -> bool {
@@ -127,6 +157,10 @@ pub fn ensure_url_favicon_cached(url: &str) -> bool {
     crate::services::favicon::ensure_favicon_cached(&domain).is_some()
 }
 
+/// Queue a favicon fetch on a background worker.
+///
+/// Callers never wait for the result — the icon is a local cache file, and the
+/// UI repaints when the file is published.
 pub fn spawn_ensure_url_favicon_cached(url: String) {
     submit(UrlAssetJob::Favicon { url });
 }

@@ -719,9 +719,10 @@ impl QuickPasteView {
         cx.notify();
     }
 
-    /// Redraw after an async thumbnail finished generating. The main list is
-    /// refreshed via `ClipboardChanged`; the popup needs an explicit notify.
-    pub(crate) fn notify_thumbnail_ready(&mut self, cx: &mut Context<Self>) {
+    /// Redraw after a background asset (thumbnail, favicon) finished
+    /// generating. The main list is refreshed via `ClipboardChanged` /
+    /// `FaviconReady`; the popup needs an explicit notify.
+    pub(crate) fn notify_asset_ready(&mut self, cx: &mut Context<Self>) {
         cx.notify();
     }
 

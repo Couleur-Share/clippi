@@ -245,6 +245,13 @@ impl RootView {
                         this.list_view.update(cx, |_list, cx| cx.notify());
                     }
                 }
+                WindowManagerEvent::FaviconReady => {
+                    // A background favicon fetch published a cache file. Cards
+                    // resolve the icon from that file while rendering, so a
+                    // repaint is enough — replacing the list would reset
+                    // selection and scroll position.
+                    this.list_view.update(cx, |_list, cx| cx.notify());
+                }
                 WindowManagerEvent::PasteShortcutRecorded { app_name, shortcut } => {
                     this.settings_panel.update(cx, |panel, cx| {
                         panel.recording_paste_shortcut = None;

@@ -372,6 +372,13 @@ fn clean_unreferenced_icons_in(db: &Database, images_dir: &Path, stats: &mut Cle
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
+            // In-flight cache writes are staged under a dot-prefixed name in
+            // this directory and renamed onto their final name a moment later.
+            // Removing one would only fail that write, but skipping them keeps
+            // the scan from racing a publish it cannot see.
+            if name.starts_with('.') {
+                continue;
+            }
             let stem = name.strip_suffix(".png").unwrap_or(name);
             if !referenced.contains(stem) {
                 match fs::remove_file(&path) {

@@ -1843,8 +1843,10 @@ impl RenderOnce for ClipboardCard {
             }
             DisplayKind::Link => {
                 // --- Favicon priority: cache → source app icon → type icon ---
-                // --- Only checks local cache — network fetch happens async ---
-                // --- in the clipboard detection thread (ensure_favicon_cached). ---
+                // --- Only checks the local cache file here. The fetch runs on ---
+                // --- a `url_assets` background worker and repaints this card ---
+                // --- through `WindowManagerEvent::FaviconReady` once the file ---
+                // --- is published. ---
                 let domain = url_domain(full_text);
                 let favicon_path = if domain.is_empty() {
                     None

@@ -12,7 +12,6 @@ use crate::core::types::{
     ContentType, FileData, FileInfo, PendingImageView, RichData, SourceAppInfo,
 };
 use crate::platform::source;
-use crate::services::favicon;
 use chrono::Utc;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 use clipboard_rs::common::RustImage;
@@ -1009,10 +1008,10 @@ fn detect_text_content_with_readers(
     });
     if let Some(text) = text {
         if is_url(&text) {
-            // --- Prefetch favicon in background thread (non-critical) ---
-            if let Some(host) = crate::core::secret::url_clean_host(&text) {
-                let _ = favicon::ensure_favicon_cached(&host);
-            }
+            // --- Detection stays I/O-free: no favicon fetch (and no other ---
+            // --- network or disk work) while the clipboard is held. The item ---
+            // --- reaches `pending` immediately, and favicon + page title are ---
+            // --- requested afterwards by `url_assets::spawn_link_metadata`. ---
             let mut item = ClipboardItem::new_text(
                 0,
                 &text,

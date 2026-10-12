@@ -338,6 +338,9 @@ pub enum WindowManagerEvent {
     /// A background source-file existence probe completed; repaint cards
     /// without replacing the list or resetting selection.
     FileStatusChanged,
+    /// A background favicon fetch published a new cache file; repaint cards
+    /// that show link icons, without touching the list contents.
+    FaviconReady,
     /// Paste shortcut recording completed for an app.
     PasteShortcutRecorded {
         app_name: String,
@@ -1932,11 +1935,26 @@ impl WindowManager {
             // Async thumbnail generation completed — the main list refreshes
             // via ClipboardChanged, but the Quick Paste popup needs an
             // explicit redraw so placeholders are replaced by thumbnails.
-            if self.quick_visible {
-                if let Some(view) = self.quick_view.clone() {
-                    view.update(cx, |view, cx| view.notify_thumbnail_ready(cx));
-                }
-            }
+            self.notify_quick_asset_ready(cx);
+        }
+
+        // A background favicon fetch published a new cache file. Cards read the
+        // icon straight from that file, so the lists only need a repaint:
+        // replacing their items would drop selection and scroll position.
+        if crate::services::favicon::take_favicon_ready() {
+            cx.emit(WindowManagerEvent::FaviconReady);
+            self.notify_quick_asset_ready(cx);
+        }
+    }
+
+    /// Redraw the Quick Paste popup after a background asset (thumbnail or
+    /// favicon) landed. The main list is refreshed through its own event.
+    fn notify_quick_asset_ready(&mut self, cx: &mut Context<Self>) {
+        if !self.quick_visible {
+            return;
+        }
+        if let Some(view) = self.quick_view.clone() {
+            view.update(cx, |view, cx| view.notify_asset_ready(cx));
         }
     }
 
