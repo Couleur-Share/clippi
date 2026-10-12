@@ -346,6 +346,7 @@ impl UpdateChecker {
             .get(&url)
             .set("User-Agent", &user_agent)
             .set("Accept", "application/vnd.github.v3+json")
+            .set("Cache-Control", "no-cache")
             .call()
             .map_err(classify_github_query_error)?;
 

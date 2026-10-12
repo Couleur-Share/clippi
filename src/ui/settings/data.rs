@@ -95,7 +95,12 @@ impl SettingsPanel {
                         Some(Err(error)) => {
                             log::error!("Read local backup failed: {error}");
                             cx.emit(SettingsEvent::DataError(
-                                I18nKey::LocalRestoreFailed.text().to_owned(),
+                                if error == crate::core::backup::PLATFORM_MISMATCH {
+                                    I18nKey::LocalRestorePlatformMismatch.text()
+                                } else {
+                                    I18nKey::LocalRestoreFailed.text()
+                                }
+                                .to_owned(),
                             ));
                         }
                         _ => {}
@@ -119,6 +124,9 @@ impl SettingsPanel {
             ));
             return;
         }
+        let Some(operation_guard) = self.window_manager.read(cx).try_start_data_operation() else {
+            return;
+        };
         let dialog = self
             .local_backup_dialog
             .take()
@@ -127,6 +135,7 @@ impl SettingsPanel {
         self.local_backup_busy = true;
         let settings = self.state.read(cx).settings.clone();
         let restore = dialog.prepared.is_some();
+        let selected = dialog.selected;
         let guard = if restore {
             None
         } else {
@@ -135,9 +144,11 @@ impl SettingsPanel {
         cx.notify();
         self._local_backup_task = Some(cx.spawn(async move |weak, cx| {
             let result = if let Some(prepared) = dialog.prepared {
+                let background_guard = operation_guard.clone();
                 Some(
                     cx.background_spawn(async move {
-                        prepared.restore(&settings, dialog.selected).map(Some)
+                        let _guard = background_guard;
+                        prepared.restore(&settings, selected).map(Some)
                     })
                     .await,
                 )
@@ -154,8 +165,10 @@ impl SettingsPanel {
                 drop(guard);
                 if let Some(file) = file {
                     let path = file.path().to_path_buf();
+                    let background_guard = operation_guard.clone();
                     Some(
                         cx.background_spawn(async move {
+                            let _guard = background_guard;
                             crate::core::backup::create_selected(&settings, &path, dialog.selected)
                                 .map(|()| None)
                         })
@@ -169,8 +182,17 @@ impl SettingsPanel {
                 let _ = panel.update(cx, |panel, cx| {
                     panel.local_backup_busy = false;
                     match result {
-                        Some(Ok(Some(settings))) => {
+                        Some(Ok(Some(mut settings))) => {
                             let previous = panel.state.read(cx).settings.clone();
+                            // Preserve unselected settings as they are at commit time,
+                            // including changes made while the archive was restored.
+                            if !selected.settings {
+                                let restored_path = settings.db_path;
+                                settings = previous.clone();
+                                settings.db_path = restored_path;
+                            } else if !selected.data {
+                                settings.db_path = previous.db_path.clone();
+                            }
                             let commit =
                                 settings.save_atomic_to(&crate::core::paths::config_path());
                             match commit.and_then(|()| crate::core::settings::spawn_new_process()) {
@@ -210,6 +232,7 @@ impl SettingsPanel {
                     cx.notify();
                 });
             }
+            drop(operation_guard);
         }));
     }
 
@@ -390,6 +413,7 @@ impl SettingsPanel {
             .to_string_lossy()
             .to_string();
         let maintenance_running = self.window_manager.read(cx).is_maintenance_running();
+        let storage_operation_running = self.window_manager.read(cx).is_data_operation_running();
         // --- borrow released ---
 
         let mut container = div().flex().flex_col().gap(px(14.)).pt(px(8.));
@@ -461,9 +485,24 @@ impl SettingsPanel {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .cursor(CursorStyle::PointingHand)
-                                .hover(move |s| s.opacity(0.85))
+                                .opacity(if maintenance_running { 0.55 } else { 1.0 })
+                                .cursor(if maintenance_running {
+                                    CursorStyle::Arrow
+                                } else {
+                                    CursorStyle::PointingHand
+                                })
+                                .hover(move |s| {
+                                    s.opacity(if maintenance_running { 0.55 } else { 0.85 })
+                                })
                                 .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
+                                    let Some(storage_guard) = this
+                                        .read(_cx)
+                                        .window_manager
+                                        .read(_cx)
+                                        .try_start_data_operation()
+                                    else {
+                                        return;
+                                    };
                                     let dialog_guard = this
                                         .read(_cx)
                                         .window_manager
@@ -475,6 +514,7 @@ impl SettingsPanel {
                                     let state = state.clone();
                                     let task_panel = this.clone();
                                     let task = _cx.spawn(async move |cx| {
+                                        let _storage_guard = storage_guard;
                                         let selected = dialog.await;
                                         drop(dialog_guard);
                                         let Some(new_path) = selected else {
@@ -548,7 +588,12 @@ impl SettingsPanel {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .cursor(CursorStyle::PointingHand)
+                                .opacity(if maintenance_running { 0.55 } else { 1.0 })
+                                .cursor(if maintenance_running {
+                                    CursorStyle::Arrow
+                                } else {
+                                    CursorStyle::PointingHand
+                                })
                                 .hover(move |s| s.bg(rgba(0xffffff10)))
                                 .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
                                     this.update(_cx, |panel, cx| {
@@ -1104,7 +1149,9 @@ impl SettingsPanel {
                                         .text_size(fs(11.))
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(rgb(0xffffff))
-                                        .child(if maintenance_running {
+                                        .child(if storage_operation_running {
+                                            I18nKey::LocalBackupBusy.text()
+                                        } else if maintenance_running {
                                             I18nKey::BtnCleaning.text()
                                         } else {
                                             I18nKey::BtnCleanupNow.text()
@@ -1198,7 +1245,9 @@ impl SettingsPanel {
                                 .text_size(fs(11.))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(0xffffff))
-                                .child(if maintenance_running {
+                                .child(if storage_operation_running {
+                                    I18nKey::LocalBackupBusy.text()
+                                } else if maintenance_running {
                                     I18nKey::BtnClearingData.text()
                                 } else {
                                     I18nKey::BtnClearData.text()
@@ -1214,6 +1263,9 @@ impl SettingsPanel {
 
     /// Show the reset-data-directory dialog. Available regardless of portable mode.
     pub fn show_reset_data_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.window_manager.read(cx).is_maintenance_running() {
+            return;
+        }
         let portable_path = crate::core::paths::portable_db_path()
             .to_string_lossy()
             .to_string();
@@ -1254,6 +1306,9 @@ impl SettingsPanel {
     /// `is_portable_mode()` which may not reflect the user's new choice yet
     /// (e.g. switching TO portable when `is_portable_mode()` is still false).
     pub fn apply_reset_data_dir(&mut self, cx: &mut Context<Self>) {
+        let Some(_storage_guard) = self.window_manager.read(cx).try_start_data_operation() else {
+            return;
+        };
         let dialog = match self.reset_data_dialog.take() {
             Some(d) => d,
             None => return,

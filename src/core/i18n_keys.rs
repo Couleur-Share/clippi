@@ -7,7 +7,7 @@ use crate::define_i18n;
 
 define_i18n! {
     GroupLocalBackup: ("本地备份与恢复", "Local backup and restore"),
-    DescLocalBackup: ("按需备份或恢复设置和剪贴板数据", "Select settings and clipboard data to back up or restore"),
+    DescLocalBackup: ("按需备份或恢复设置和剪贴板数据，仅支持同一操作系统恢复", "Select settings and clipboard data; restore on the same operating system only"),
     BackupContents: ("选择备份内容", "Choose backup contents"),
     RestoreContents: ("选择恢复内容", "Choose restore contents"),
     BackupSettings: ("设置", "Settings"),
@@ -20,6 +20,7 @@ define_i18n! {
     LocalBackupDone: ("备份成功", "Backup successful"),
     LocalBackupFailed: ("备份失败，请检查保存位置和可用空间", "Backup failed; check the save location and available space"),
     LocalRestoreFailed: ("恢复失败，请检查备份是否完整有效", "Restore failed; check that the backup is complete and valid"),
+    LocalRestorePlatformMismatch: ("只能恢复同一操作系统的备份，备份平台必须与当前系统一致", "Restore requires a backup created on the same operating system"),
     // ─── App ───
     AppName:            ("Clippi 剪贴板", "Clippi Clipboard"),
 

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use chrono::Datelike;
 use gpui::*;
 
+use crate::core::data_operation::{DataOperationGuard, DataOperationState};
 use crate::core::frontend::{
     clamp_to_work_area, PositionMode, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, PANEL_OFFSET_X,
     SUPPRESS_DURATION_MS,
@@ -360,6 +361,7 @@ pub enum WindowManagerEvent {
     BitmapPasteFinished,
     /// A background data maintenance task completed or failed.
     DataMaintenanceToast(String),
+    DataOperationChanged,
     /// Reset RootView to clipboard history page (when always_reset_to_clipboard is on).
     ResetToClipboard,
 }
@@ -595,6 +597,7 @@ pub struct WindowManager {
     // --- Update state ---
     /// Pending update info from background check thread (consumed by poll loop).
     pending_update: Arc<Mutex<Option<update::UpdateInfo>>>,
+    pending_download_info: Arc<Mutex<Option<update::UpdateInfo>>>,
     /// Pending update phase from background download/install thread.
     pending_update_phase: Arc<Mutex<update::UpdatePhase>>,
     /// Result of the restart installer launch (consumed by poll_update).
@@ -607,6 +610,8 @@ pub struct WindowManager {
     pending_cleanup_hotkey_unregister: Arc<Mutex<Vec<i64>>>,
     /// If Some, a background maintenance job is running.
     maintenance_job_running: bool,
+    data_operation: DataOperationState,
+    data_operation_observed: bool,
     /// Pending result from a completed maintenance job.
     pending_maintenance_result: Arc<Mutex<Option<DataMaintenanceResult>>>,
     /// When a maintenance job partially failed, retry no earlier than this
@@ -738,12 +743,15 @@ impl WindowManager {
             _quick_position_task: None,
             _recording_poll_task: None,
             pending_update: Arc::new(Mutex::new(None)),
+            pending_download_info: Arc::new(Mutex::new(None)),
             pending_update_phase: Arc::new(Mutex::new(update::UpdatePhase::Idle)),
             pending_restart_result: Arc::new(Mutex::new(None)),
             update_check_running: Arc::new(AtomicBool::new(false)),
             pending_cleanup_refresh: Arc::new(AtomicBool::new(false)),
             pending_cleanup_hotkey_unregister: Arc::new(Mutex::new(Vec::new())),
             maintenance_job_running: false,
+            data_operation: DataOperationState::default(),
+            data_operation_observed: false,
             pending_maintenance_result: Arc::new(Mutex::new(None)),
             maintenance_retry_after: None,
             config_sync_service,
@@ -927,6 +935,11 @@ impl WindowManager {
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
+        let operation_active = self.data_operation.is_active();
+        if operation_active != self.data_operation_observed {
+            self.data_operation_observed = operation_active;
+            cx.emit(WindowManagerEvent::DataOperationChanged);
+        }
         // --- 1. Hotkey press -> show window ---
         self.poll_hotkey(cx);
 
@@ -1189,7 +1202,7 @@ impl WindowManager {
 
     /// Request an immediate cleanup from the settings UI.
     pub fn request_cleanup(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.maintenance_job_running {
+        if self.is_maintenance_running() {
             return false;
         }
 
@@ -1256,7 +1269,7 @@ impl WindowManager {
         include_noted: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.maintenance_job_running {
+        if self.is_maintenance_running() {
             return false;
         }
 
@@ -1326,9 +1339,18 @@ impl WindowManager {
         true
     }
 
-    /// Check if a maintenance job is currently running.
+    /// Whether maintenance or an exclusive local storage operation is running.
     pub fn is_maintenance_running(&self) -> bool {
-        self.maintenance_job_running
+        self.maintenance_job_running || self.data_operation.is_active()
+    }
+
+    pub fn is_data_operation_running(&self) -> bool {
+        self.data_operation.is_active()
+    }
+
+    pub fn try_start_data_operation(&self) -> Option<DataOperationGuard> {
+        self.data_operation
+            .try_acquire(self.maintenance_job_running)
     }
 
     // ── Config sync ──
@@ -1421,6 +1443,13 @@ impl WindowManager {
 
     /// Apply the downloaded snapshot: backup, merge, save, restart.
     pub fn apply_config_snapshot(&mut self, cx: &mut Context<Self>) {
+        if self.data_operation.is_active() {
+            self.state.update(cx, |state, cx| {
+                state.show_warning_toast(I18nKey::LocalBackupBusy.text());
+                cx.notify();
+            });
+            return;
+        }
         let snapshot = match self.config_sync_pending_snapshot.take() {
             Some(s) => s,
             None => {
@@ -5676,17 +5705,31 @@ impl WindowManager {
 
     /// Poll the shared update state from background threads and emit events.
     fn poll_update(&mut self, cx: &mut Context<Self>) {
-        // 1. Read update phase from background thread
-        if let Ok(mut phase) = self.pending_update_phase.lock() {
-            let current = phase.clone();
-            if *phase != update::UpdatePhase::Idle {
-                // Update AppState for settings page rendering
-                self.state
-                    .update(cx, |s, _| s.update_phase = current.clone());
-                cx.emit(WindowManagerEvent::UpdateProgress(current));
-                // Reset to Idle after emitting so we don't repeat
-                *phase = update::UpdatePhase::Idle;
+        // Read the phase first, then publish any resolved metadata before
+        // exposing ReadyToRestart. A worker publishes metadata before phases.
+        let current = self.pending_update_phase.lock().ok().and_then(|mut phase| {
+            if *phase == update::UpdatePhase::Idle {
+                None
+            } else {
+                Some(std::mem::replace(&mut *phase, update::UpdatePhase::Idle))
             }
+        });
+        if let Ok(mut pending) = self.pending_download_info.lock() {
+            if let Some(info) = pending.take() {
+                self.state
+                    .update(cx, |s, _| s.update_available = Some(info));
+            }
+        }
+        if let Some(current) = current {
+            if current == update::UpdatePhase::UpToDate {
+                self.state.update(cx, |s, _| s.update_available = None);
+                if let Some(ref mut tray) = self.tray {
+                    tray.set_update_available(false);
+                }
+            }
+            self.state
+                .update(cx, |s, _| s.update_phase = current.clone());
+            cx.emit(WindowManagerEvent::UpdateProgress(current));
         }
 
         // 2. Check restart installer result (non-blocking — see do_update_restart)
@@ -5848,32 +5891,43 @@ impl WindowManager {
     pub fn start_update_download(&mut self, cx: &mut Context<Self>) {
         if matches!(
             self.state.read(cx).update_phase,
-            update::UpdatePhase::Downloading { .. }
+            update::UpdatePhase::Checking
+                | update::UpdatePhase::Downloading { .. }
                 | update::UpdatePhase::Verifying
                 | update::UpdatePhase::Installing
+                | update::UpdatePhase::ReadyToRestart
         ) {
             return;
         }
-        let info = match self.state.read(cx).update_available.clone() {
-            Some(info) => info,
-            None => return,
-        };
+        if self.state.read(cx).update_available.is_none() {
+            return;
+        }
+        let channel =
+            update::UpdateChannel::from_setting(&self.state.read(cx).settings.update_channel);
 
-        self.state.update(cx, |s, _| {
-            s.update_phase = update::UpdatePhase::Downloading { progress: 0 }
-        });
+        self.state
+            .update(cx, |s, _| s.update_phase = update::UpdatePhase::Checking);
         cx.emit(WindowManagerEvent::UpdateProgress(
-            update::UpdatePhase::Downloading { progress: 0 },
+            update::UpdatePhase::Checking,
         ));
 
         let pending_phase = self.pending_update_phase.clone();
         let pending_phase_err = self.pending_update_phase.clone();
+        let pending_download_info = self.pending_download_info.clone();
         std::thread::spawn(move || {
-            let result = crate::services::updater::download_and_prepare(&info, move |phase| {
-                if let Ok(mut p) = pending_phase.lock() {
-                    *p = phase;
-                }
-            });
+            let result = crate::services::updater::download_latest_and_prepare(
+                channel,
+                move |phase| {
+                    if let Ok(mut p) = pending_phase.lock() {
+                        *p = phase;
+                    }
+                },
+                move |info| {
+                    if let Ok(mut pending) = pending_download_info.lock() {
+                        *pending = Some(info);
+                    }
+                },
+            );
             if let Err(e) = result {
                 log::error!("[wm] update download/prepare failed: {e}");
                 if let Ok(mut p) = pending_phase_err.lock() {
@@ -5954,7 +6008,7 @@ impl WindowManager {
 
     /// Run periodic maintenance for local caches, retained history, and transfer files.
     fn poll_cleanup(&mut self, cx: &mut Context<Self>) {
-        if self.maintenance_job_running {
+        if self.is_maintenance_running() {
             return; // A job is already in progress.
         }
         if let Some(retry_after) = self.maintenance_retry_after {

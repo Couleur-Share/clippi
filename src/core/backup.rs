@@ -9,6 +9,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+pub const PLATFORM_MISMATCH: &str = "Backup platform does not match this operating system";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupContents {
     pub settings: bool,
@@ -46,6 +48,8 @@ impl BackupContents {
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     version: u32,
+    #[serde(default)]
+    platform: String,
     data_dir: PathBuf,
     files: BTreeMap<String, String>,
     #[serde(default)]
@@ -285,6 +289,7 @@ fn create_folder_selected(
             settings.save_atomic_to(&target.join("clippi.toml"))?;
         }
         if contents.data {
+            let _cache_guard = super::data_operation::lock_cache_io();
             let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(|e| e.to_string())?;
             conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -306,7 +311,8 @@ fn create_folder_selected(
         let mut files = BTreeMap::new();
         inventory(&target, &target, &mut files)?;
         let manifest = Manifest {
-            version: 2,
+            version: 3,
+            platform: std::env::consts::OS.to_owned(),
             data_dir: data.to_path_buf(),
             files,
             contents,
@@ -372,8 +378,13 @@ fn validate_snapshot(source: &Path) -> Result<Manifest, String> {
     let manifest: Manifest =
         serde_json::from_slice(&fs::read(source.join("manifest.json")).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-    if !matches!(manifest.version, 1 | 2) || manifest.contents.is_empty() {
+    if manifest.version != 3 || manifest.contents.is_empty() {
         return Err("Unsupported backup version".into());
+    }
+    // Local archives contain native paths and platform-specific preferences.
+    // Do not guess the platform of archives created before this metadata existed.
+    if manifest.platform != std::env::consts::OS {
+        return Err(PLATFORM_MISMATCH.into());
     }
     let mut files = BTreeMap::new();
     inventory(source, source, &mut files)?;
@@ -647,33 +658,76 @@ mod tests {
     }
 
     #[test]
-    fn legacy_full_archives_can_restore_only_settings() {
+    fn foreign_and_unknown_platforms_are_rejected_before_restore() {
         let (root, backup, current) = selective_fixture();
         let snapshot = create_folder(&backup, root.path()).unwrap();
         let manifest_path = snapshot.join("manifest.json");
-        let mut manifest: serde_json::Value =
+        let original: serde_json::Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest["version"] = 1.into();
-        manifest.as_object_mut().unwrap().remove("contents");
-        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let zip = root.path().join("legacy.zip");
-        let mut archive = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
-        zip_tree(&snapshot, &snapshot, &mut archive).unwrap();
-        archive.finish().unwrap();
-        let prepared = prepare_restore(&zip).unwrap();
-        assert_eq!(prepared.contents(), BackupContents::default());
-        let restored = prepared
-            .restore(
-                &current,
+        assert_eq!(original["platform"], std::env::consts::OS);
+        assert_eq!(original["version"], 3);
+        for platform in [
+            Some("windows"),
+            Some("macos"),
+            Some("linux"),
+            Some(""),
+            None,
+        ] {
+            if platform == Some(std::env::consts::OS) {
+                continue;
+            }
+            let mut manifest = original.clone();
+            if let Some(platform) = platform {
+                manifest["platform"] = platform.into();
+            } else {
+                manifest.as_object_mut().unwrap().remove("platform");
+            }
+            fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let zip = root.path().join("foreign.zip");
+            let mut archive = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
+            zip_tree(&snapshot, &snapshot, &mut archive).unwrap();
+            archive.finish().unwrap();
+            assert_eq!(prepare_restore(&zip).err().unwrap(), PLATFORM_MISMATCH);
+            for selected in [
+                BackupContents::default(),
                 BackupContents {
                     settings: true,
                     data: false,
                 },
-            )
-            .unwrap();
-        assert_eq!(restored.db_path, current.db_path);
-        assert_eq!(restored.max_items, backup.max_items);
-        assert_eq!(history(&restored), "current history");
+                BackupContents {
+                    settings: false,
+                    data: true,
+                },
+            ] {
+                assert_eq!(
+                    restore_folder_selected(&snapshot, &current, selected).unwrap_err(),
+                    PLATFORM_MISMATCH
+                );
+            }
+            assert_eq!(history(&current), "current history");
+            assert!(fs::read_dir(Path::new(&current.db_path).parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("clippi-restored-")));
+        }
+    }
+
+    #[test]
+    fn legacy_archives_without_platform_metadata_are_rejected() {
+        let (root, backup, _) = selective_fixture();
+        let snapshot = create_folder(&backup, root.path()).unwrap();
+        let manifest_path = snapshot.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("platform");
+        for version in [1, 2, 4] {
+            manifest["version"] = version.into();
+            fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(validate_snapshot(&snapshot).is_err());
+        }
     }
 
     #[test]

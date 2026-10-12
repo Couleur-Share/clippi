@@ -920,6 +920,7 @@ fn download_file(
     entry: &ManifestEntry,
 ) -> Result<String, String> {
     entry.validate()?;
+    let _cache_guard = crate::core::data_operation::lock_cache_io();
     let directory = paths::transfer_cache_dir().join(&entry.hash);
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("create transfer cache: {error}"))?;
@@ -1449,6 +1450,7 @@ fn detach_local_transfer_in(db: &Database, hash: &str, cache_root: &Path) {
 }
 
 fn clean_local_transfer(db: &Database, hash: &str) {
+    let _cache_guard = crate::core::data_operation::lock_cache_io();
     let hash_dir = transfer_hash_directory(hash);
     if let Ok(items) = db.get_transfer_items() {
         for item in items {

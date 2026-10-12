@@ -5,11 +5,48 @@
 
 use std::path::Path;
 
-use super::update::{UpdateInfo, UpdatePhase};
+use super::update::{UpdateChannel, UpdateChecker, UpdateInfo, UpdatePhase};
+
+/// Resolve the current package when the user clicks download. Keep its URL,
+/// filename and checksum together rather than redirecting a stale package URL.
+pub fn download_latest_and_prepare(
+    channel: UpdateChannel,
+    phase_callback: impl Fn(UpdatePhase) + Send + 'static,
+    on_resolved: impl FnOnce(UpdateInfo),
+) -> Result<(), String> {
+    phase_callback(UpdatePhase::Checking);
+    let checker = UpdateChecker::new(env!("CARGO_PKG_VERSION"), "Ruszero01", "clippi");
+    let latest = resolve_download_info(
+        || {
+            checker
+                .check_full(channel)
+                .map_err(|error| error.user_message())
+        },
+        on_resolved,
+    )?;
+    match latest {
+        Some(info) => download_and_prepare(&info, phase_callback),
+        None => {
+            phase_callback(UpdatePhase::UpToDate);
+            Ok(())
+        }
+    }
+}
+
+fn resolve_download_info(
+    resolve: impl FnOnce() -> Result<Option<UpdateInfo>, String>,
+    on_resolved: impl FnOnce(UpdateInfo),
+) -> Result<Option<UpdateInfo>, String> {
+    let info = resolve()?;
+    if let Some(info) = &info {
+        on_resolved(info.clone());
+    }
+    Ok(info)
+}
 
 /// Download, verify, and prepare an update. Blocking — call from background thread.
 /// `phase_callback` is invoked on each phase transition for UI updates.
-pub fn download_and_prepare(
+fn download_and_prepare(
     info: &UpdateInfo,
     phase_callback: impl Fn(UpdatePhase) + Send + 'static,
 ) -> Result<(), String> {
@@ -183,5 +220,52 @@ fn terminate_processes_in_dir(dir: &Path) {
             }
             CloseHandle(process);
         }
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+    use crate::services::update::UpdateSource;
+
+    #[test]
+    fn resolved_package_updates_installer_name_and_checksum_together() {
+        let latest = UpdateInfo {
+            latest_version: "0.5.1".into(),
+            release_notes: "Latest release".into(),
+            download_url: "https://example.invalid/v0.5.1/Clippi_0.5.1_x64-setup.exe".into(),
+            checksum_url: String::new(),
+            asset_name: "Clippi_0.5.1_x64-setup.exe".into(),
+            asset_size: 123,
+            sha256: Some("b".repeat(64)),
+            source: UpdateSource::Oss,
+        };
+        let mut published = None;
+        let download = resolve_download_info(|| Ok(Some(latest)), |info| published = Some(info))
+            .unwrap()
+            .unwrap();
+        let installer = published.unwrap();
+        assert_eq!(download.latest_version, "0.5.1");
+        assert_eq!(download.asset_name, "Clippi_0.5.1_x64-setup.exe");
+        assert_eq!(download.sha256, Some("b".repeat(64)));
+        assert_eq!(installer.download_url, download.download_url);
+        assert_eq!(installer.asset_name, download.asset_name);
+        assert_eq!(installer.asset_size, download.asset_size);
+        assert_eq!(installer.sha256, download.sha256);
+    }
+
+    #[test]
+    fn no_latest_package_or_failed_check_never_reuses_the_old_prompt() {
+        assert!(
+            resolve_download_info(|| Ok(None), |_| panic!("no package to install"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            resolve_download_info(|| Err("offline".into()), |_| panic!("check failed"))
+                .err()
+                .unwrap(),
+            "offline"
+        );
     }
 }

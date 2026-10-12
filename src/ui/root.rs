@@ -375,6 +375,16 @@ impl RootView {
                     }
                     use crate::services::update::UpdatePhase;
                     match phase {
+                        UpdatePhase::Checking => {
+                            this._toast_timer = None;
+                            this.toast_dismissing = false;
+                            this.state.update(cx, |s, _| {
+                                s.toast_message = Some(I18nKey::VersionChecking.text().to_string());
+                            });
+                            this.toast_actions = Some(Vec::new());
+                            this.toast_timer_expiry =
+                                Some(std::time::Instant::now() + Duration::from_secs(3600));
+                        }
                         UpdatePhase::Downloading { progress } => {
                             // The first progress event replaces the update prompt;
                             // subsequent percentage events keep the same timer.
@@ -438,7 +448,13 @@ impl RootView {
                                 Some(std::time::Instant::now() + Duration::from_secs(5));
                         }
                         UpdatePhase::UpToDate => {
-                            // Silent — no toast for "up to date".
+                            if this.state.read(cx).toast_message.as_deref()
+                                == Some(I18nKey::VersionChecking.text())
+                            {
+                                this.state.update(cx, |s, _| s.clear_toast());
+                                this.toast_actions = None;
+                                this.toast_timer_expiry = None;
+                            }
                         }
                         _ => {}
                     }
@@ -454,6 +470,10 @@ impl RootView {
                         this.state.update(cx, |s, _cx| s.clear_toast());
                         cx.notify();
                     }
+                }
+                WindowManagerEvent::DataOperationChanged => {
+                    this.settings_panel.update(cx, |_, cx| cx.notify());
+                    cx.notify();
                 }
                 WindowManagerEvent::DataMaintenanceToast(message) => {
                     this._toast_timer = None;

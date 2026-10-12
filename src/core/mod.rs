@@ -4,6 +4,7 @@ pub mod backup;
 pub mod cache_cleanup;
 pub mod color;
 pub mod config_sync;
+pub mod data_operation;
 pub mod db;
 pub mod filters;
 pub mod find_replace;
