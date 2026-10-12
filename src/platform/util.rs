@@ -163,6 +163,104 @@ pub fn hicon_to_base64_png(
     }
 }
 
+/// Decode a byte run that a document escaped as single-byte `\'hh` sequences.
+///
+/// `codepage` is the document's declared ANSI code page (`\ansicpgN` in RTF),
+/// or 0 when it is unknown and the system default should be used. RichEdit-based
+/// Windows sources (Event Viewer, WordPad, most Win32 rich-edit controls) escape
+/// CJK text in the system code page — cp936 for Chinese Windows — so the bytes
+/// must go through the code page instead of being mapped one-to-one to scalars,
+/// which would produce mojibake such as `´íÎó` for `错误` (issue #114).
+#[cfg(target_os = "windows")]
+pub fn decode_ansi_bytes(codepage: u16, bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{IsValidCodePage, MultiByteToWideChar, CP_ACP};
+
+    if bytes.is_empty() {
+        return String::new();
+    }
+    // SAFETY: `IsValidCodePage` only inspects its value argument.
+    let code_page_is_known = codepage != 0 && unsafe { IsValidCodePage(codepage as u32) } != 0;
+    let page = if code_page_is_known {
+        codepage as u32
+    } else {
+        CP_ACP
+    };
+
+    // SAFETY: `MultiByteToWideChar` reads exactly `bytes.len()` bytes from the
+    // input pointer and writes at most `wide.len()` UTF-16 units into the
+    // output buffer. Both calls use the same input, and the second call is only
+    // made when the first reported a positive unit count.
+    unsafe {
+        let needed = MultiByteToWideChar(
+            page,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        );
+        if needed <= 0 {
+            return latin1_to_string(bytes);
+        }
+        let mut wide = vec![0u16; needed as usize];
+        let written = MultiByteToWideChar(
+            page,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            needed,
+        );
+        if written <= 0 {
+            return latin1_to_string(bytes);
+        }
+        wide.truncate(written as usize);
+        String::from_utf16_lossy(&wide)
+    }
+}
+
+/// Best-effort counterpart of [`decode_ansi_bytes`] for platforms without a
+/// code-page API. Byte values are mapped to the matching Latin-1 scalar, which
+/// is exact for ASCII and for the RTF default code page 1252 letters/accents,
+/// and approximate elsewhere. UTF-8 (65001) is decoded exactly everywhere.
+///
+/// TODO(macOS): resolve the declared code page instead of approximating it, so
+/// an RTF entry captured on Windows (cp936/cp950/cp932/cp949/1251 — the code
+/// page is already resolved for us by `core::rtf_text::initial_codepage`) keeps
+/// its text after syncing to a Mac. To be done on a Mac:
+///
+/// 1. `CFStringConvertWindowsCodepageToEncoding(codepage as u32)` returns the
+///    matching `CFStringEncoding`; treat `kCFStringEncodingInvalidId` as
+///    "unknown" and keep the Latin-1 fallback.
+/// 2. `CFStringCreateWithBytes(null, bytes.as_ptr(), bytes.len() as isize,
+///    encoding, false)` builds the string. Convert it to Rust with
+///    `CFStringGetMaximumSizeForEncoding` + `CFStringGetCString(..,
+///    kCFStringEncodingUTF8)` into a `Vec<u8>`, or wrap the ref in an
+///    `NSString` through `objc2-foundation` and read its UTF-8 bytes.
+/// 3. `CFRelease` the `CFStringRef` on both the success and the failure path,
+///    and fall back to [`latin1_to_string`] whenever either step fails.
+///
+/// CoreFoundation is already linked (`core-foundation` /
+/// `objc2-core-foundation` are dependencies) and `core::rtf_text` hands this
+/// function a plain numeric code page, so no RTF-side change is needed.
+/// Verification: `core::rtf_text::tests` asserts cp936 decoding in
+/// `gbk_byte_run_decodes_through_the_document_code_page` and
+/// `missing_ansicpg_decodes_through_the_font_charset`; both are
+/// `#[cfg(target_os = "windows")]` only because this fallback is approximate —
+/// drop the gates and run `cargo test rtf` on the Mac to prove the adaptation.
+#[cfg(not(target_os = "windows"))]
+pub fn decode_ansi_bytes(codepage: u16, bytes: &[u8]) -> String {
+    if codepage == 65001 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    latin1_to_string(bytes)
+}
+
+/// Map raw bytes to the Latin-1 scalars with the same values (never fails).
+fn latin1_to_string(bytes: &[u8]) -> String {
+    bytes.iter().copied().map(char::from).collect()
+}
+
 // macOS geometry types for use with objc2 Encode (available for future needs).
 // Kept for potential use with CoreGraphics rendering paths.
 #[cfg(target_os = "macos")]

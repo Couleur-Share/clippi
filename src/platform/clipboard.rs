@@ -1006,6 +1006,18 @@ fn detect_text_content_with_readers(
             .map(crate::core::html_text::visible_text)
             .filter(|text| !text.is_empty())
     });
+    // RTF-only sources (no plain-text flavour, no CF_HTML) still carry content:
+    // decode the payload instead of dropping the capture. `core::rtf_text`
+    // resolves the document code page, so CJK payloads from RichEdit-based
+    // applications are not turned into mojibake (issue #114).
+    let text = text.or_else(|| {
+        rich_data
+            .as_ref()?
+            .rtf
+            .as_deref()
+            .map(crate::core::rtf_text::rtf_to_plain_text)
+            .filter(|text| !text.is_empty())
+    });
     if let Some(text) = text {
         if is_url(&text) {
             // --- Detection stays I/O-free: no favicon fetch (and no other ---
@@ -1851,6 +1863,27 @@ mod rich_capture_tests {
             )),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rtf_only_payload_is_captured_from_its_decoded_text() {
+        // RichEdit-family sources can put RTF on the clipboard without a
+        // plain-text flavour; the decoded text is what the entry holds.
+        let rich = RichData {
+            rtf: Some(r"{\rtf1\ansi\uc1\pard\f0\fs20 \u38169?\u35823?}".into()),
+            ..Default::default()
+        };
+        let item = detect_text_content_with_readers(
+            false,
+            || panic!("an unavailable text format must not be read"),
+            || Some(rich.clone()),
+            &None,
+        )
+        .expect("an RTF-only payload must still be captured");
+
+        assert_eq!(item.full_text, "错误");
+        assert_eq!(item.display_kind(), DisplayKind::Rtf);
+        assert_eq!(RichData::from_json(&item.rich_data).rtf, rich.rtf);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 /// Content type of clipboard items.
 ///
 /// There are four primary types. Semantic sub-types (link, path, color, email,
-/// phone, markdown, html) are recorded in the `meta_type` field.
+/// phone, markdown, html, rtf) are recorded in the `meta_type` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {
     PlainText,
@@ -34,7 +34,10 @@ impl ContentType {
     pub fn from_str(s: &str) -> Self {
         match s {
             "plain_text" | "text" => ContentType::PlainText,
-            "rich_text" | "html" => ContentType::RichText,
+            // `html` / `rtf` are stored as rich_text; the sub-type lives in
+            // `meta_type`, but payloads written by older versions may carry them
+            // as the primary type.
+            "rich_text" | "html" | "rtf" => ContentType::RichText,
             "image" => ContentType::Image,
             "file" => ContentType::File,
             // Legacy: link/path/color migrated to plain_text + meta_type in v4
@@ -498,6 +501,7 @@ impl ClipboardItem {
         match self.meta_type.as_str() {
             "markdown" => return DisplayKind::Markdown,
             "html" => return DisplayKind::Html,
+            "rtf" => return DisplayKind::Rtf,
             "email" => return DisplayKind::Email,
             "phone" => return DisplayKind::Phone,
             "link" => return DisplayKind::Link,
@@ -542,13 +546,15 @@ impl ClipboardItem {
         match self.display_kind() {
             DisplayKind::Html => "html",
             DisplayKind::Markdown => "markdown",
+            DisplayKind::Rtf => "rtf",
             DisplayKind::Email => "email",
             DisplayKind::Phone => "phone",
             DisplayKind::Link => "link",
             DisplayKind::Path => "path",
             DisplayKind::Color => "color",
             DisplayKind::Secret => "secret",
-            // RTF and plain text share one type: the panel edits either as text.
+            // RTF keeps its own type and is edited as text; plain text shares
+            // the fallback.
             _ => "plain_text",
         }
     }
@@ -1053,6 +1059,31 @@ mod tests {
             assert!(!data.transfer);
             assert!(data.remote_hash.is_empty());
         }
+    }
+
+    /// RTF is a first-class rich sub-type, next to HTML and Markdown.
+    #[test]
+    fn rtf_entries_keep_an_rtf_type_and_editor_type() {
+        let mut item = ClipboardItem::new_text(
+            1,
+            "错误",
+            ContentType::RichText,
+            None,
+            Some(&RichData {
+                rtf: Some(r"{\rtf1\ansi\uc1\u38169?\u35823?}".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(item.display_kind(), DisplayKind::Rtf);
+        assert_eq!(item.editor_type(), "rtf");
+
+        // The editor records the sub-type explicitly, so it survives even when
+        // the payload itself is gone.
+        item.rich_data = String::new();
+        item.meta_type = "rtf".to_string();
+        assert_eq!(item.display_kind(), DisplayKind::Rtf);
+        assert_eq!(item.editor_type(), "rtf");
+        assert_eq!(ContentType::from_str("rtf"), ContentType::RichText);
     }
 
     #[test]

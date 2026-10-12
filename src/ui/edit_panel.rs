@@ -26,10 +26,11 @@ const FIND_ROW_H: f32 = 26.0;
 const FIND_BAR_GAP: f32 = 4.0;
 const FIND_BAR_H: f32 = FIND_ROW_H;
 
-const TYPE_OPTIONS: [(&str, I18nKey); 9] = [
+const TYPE_OPTIONS: [(&str, I18nKey); 10] = [
     ("plain_text", I18nKey::EditTypeText),
     ("markdown", I18nKey::EditTypeMarkdown),
     ("html", I18nKey::EditTypeHtml),
+    ("rtf", I18nKey::EditTypeRtf),
     ("link", I18nKey::EditTypeUrl),
     ("path", I18nKey::EditTypePath),
     ("color", I18nKey::EditTypeColor),
@@ -1202,7 +1203,8 @@ fn is_rich_editor_type(t: &str) -> bool {
 
 /// HTML 是唯一一种其他类型无法承载的内容：它的缓冲区里是带标签的文档，
 /// 其他类型只能编辑其中的可见文本。Markdown 与纯文本同为文本，切换时
-/// 内容原样保留。
+/// 内容原样保留。RTF 也按可见文本编辑（缓冲区是 `full_text`，不暴露 RTF
+/// 标记），保存时按文本重建载荷，因此同样不走这里的文档缓存。
 fn is_html_editor_type(t: &str) -> bool {
     t == "html"
 }
@@ -1526,6 +1528,22 @@ mod type_switch_tests {
 
         assert_eq!(switched.value, None);
         assert!(switched.cache.is_none());
+    }
+
+    /// RTF is edited as visible text: switching to or from it must not rewrite
+    /// the buffer (only HTML carries markup in the buffer).
+    #[test]
+    fn rtf_is_edited_as_text_without_rewriting_the_buffer() {
+        for (from, to) in [
+            ("plain_text", "rtf"),
+            ("rtf", "plain_text"),
+            ("rtf", "markdown"),
+            ("markdown", "rtf"),
+        ] {
+            let switched = type_switch(from, to, "错误应用程序名称", None);
+            assert_eq!(switched.value, None, "{from} -> {to} must not rewrite");
+            assert!(switched.cache.is_none());
+        }
     }
 
     /// A cache survives switches that do not touch HTML, so a detour through

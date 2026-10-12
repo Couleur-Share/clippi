@@ -1332,16 +1332,29 @@ impl AppState {
     /// here. Ending the edit session is the caller's business: an external save
     /// must not close a panel the user has open on another entry.
     fn apply_content_edit(&mut self, id: i64, text: &str, editor_type: &str) -> bool {
-        let (content_type, meta_type, rich_data) = Self::storage_for_editor_type(editor_type, text);
         // Pre-flight: is the item in sync scope? Check before DB write.
         // The edited entry can be outside the currently loaded/filtered page.
-        let mark_dirty = match self.db.get_by_id(id) {
-            Ok(Some(item)) => self.should_mark_sync_dirty(&item),
+        let existing = match self.db.get_by_id(id) {
+            Ok(Some(item)) => item,
             Ok(None) => return false,
             Err(e) => {
                 log::error!("apply_content_edit({id}): cannot read item: {e}");
                 return false;
             }
+        };
+        let mark_dirty = self.should_mark_sync_dirty(&existing);
+        let (content_type, meta_type, rebuilt_rich_data) =
+            Self::storage_for_editor_type(editor_type, text);
+        // Saving an RTF entry whose text was not touched keeps the stored
+        // payload, and with it the original formatting: a plain-text edit
+        // cannot reproduce it, so only an edited text is rebuilt.
+        let keeps_stored_payload = editor_type == "rtf"
+            && text == existing.full_text
+            && RichData::from_json(&existing.rich_data).rtf.is_some();
+        let rich_data = if keeps_stored_payload {
+            existing.rich_data
+        } else {
+            rebuilt_rich_data
         };
         match self
             .db
@@ -1399,6 +1412,17 @@ impl AppState {
                     ..Default::default()
                 };
                 ("rich_text", "html", rich.to_json())
+            }
+            // RTF entries are edited as visible text, so the payload is rebuilt
+            // from it (the original formatting cannot survive a text edit).
+            // `apply_content_edit` keeps the stored payload when the text is
+            // unchanged, so an unmodified save does not lose its formatting.
+            "rtf" => {
+                let rich = RichData {
+                    rtf: Some(crate::core::rtf_text::plain_text_to_rtf(text)),
+                    ..Default::default()
+                };
+                ("rich_text", "rtf", rich.to_json())
             }
             "link" => ("plain_text", "link", String::new()),
             "path" => ("plain_text", "path", String::new()),
@@ -4353,12 +4377,15 @@ mod tests {
         );
         state.db.set_favorite(id, true).unwrap();
         state.items.clear();
-        std::fs::write(&path, "edited favorite").unwrap();
+        // The replacement must differ in *length* as well as content: an
+        // external save is detected by (len, mtime), and two same-length writes
+        // inside one system clock tick share a timestamp.
+        std::fs::write(&path, "edited favorite text").unwrap();
 
         assert!(state.poll_external_editor_edits());
         assert_eq!(
             state.db.get_by_id(id).unwrap().unwrap().full_text,
-            "edited favorite"
+            "edited favorite text"
         );
         assert!(dirty.load(Ordering::SeqCst));
         let _ = std::fs::remove_file(&path);
@@ -5091,6 +5118,66 @@ mod tests {
         assert_eq!(item.content_type, ContentType::RichText);
         assert_eq!(item.meta_type, "html");
         assert!(RichData::from_json(&item.rich_data).html.is_some());
+    }
+
+    /// An RTF entry stores a valid RTF document built from the edited text, and
+    /// keeps its own type instead of degrading to plain text.
+    #[test]
+    fn save_new_item_records_an_rtf_payload_for_the_rtf_type() {
+        let (mut state, _dirty) = test_state();
+        state.start_new_item();
+
+        let id = state.save_new_item("错误应用程序名称", "rtf").unwrap();
+
+        let item = state.db.get_by_id(id).unwrap().unwrap();
+        assert_eq!(item.content_type, ContentType::RichText);
+        assert_eq!(item.meta_type, "rtf");
+        assert_eq!(item.display_kind(), crate::core::types::DisplayKind::Rtf);
+        let rtf = RichData::from_json(&item.rich_data)
+            .rtf
+            .expect("the rtf payload must be stored");
+        assert_eq!(
+            crate::core::rtf_text::rtf_to_plain_text(&rtf),
+            "错误应用程序名称"
+        );
+    }
+
+    /// A plain-text edit cannot reproduce RTF formatting, so an untouched text
+    /// keeps the stored payload and only an edited text rebuilds it.
+    #[test]
+    fn editing_an_rtf_entry_keeps_or_rebuilds_its_payload() {
+        let (mut state, _dirty) = test_state();
+        let original = r"{\rtf1\ansi\uc1\b \u38169?\u35823?}";
+        let id = state.save_new_item("错误", "rtf").unwrap();
+        state
+            .db
+            .update_content_with_rich_data(
+                id,
+                "错误",
+                "rich_text",
+                "rtf",
+                &RichData {
+                    rtf: Some(original.to_string()),
+                    ..Default::default()
+                }
+                .to_json(),
+            )
+            .unwrap();
+
+        assert!(state.save_edited_item(id, "错误", "rtf"));
+        let stored = state.db.get_by_id(id).unwrap().unwrap();
+        assert_eq!(
+            RichData::from_json(&stored.rich_data).rtf.as_deref(),
+            Some(original),
+            "an unmodified save keeps the original payload"
+        );
+
+        assert!(state.save_edited_item(id, "错误已改", "rtf"));
+        let stored = state.db.get_by_id(id).unwrap().unwrap();
+        assert_eq!(stored.meta_type, "rtf");
+        let rtf = RichData::from_json(&stored.rich_data).rtf.unwrap();
+        assert_ne!(rtf, original);
+        assert_eq!(crate::core::rtf_text::rtf_to_plain_text(&rtf), "错误已改");
     }
 
     /// Creating content that already exists refreshes that row (upsert by

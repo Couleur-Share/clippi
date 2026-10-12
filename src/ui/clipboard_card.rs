@@ -21,6 +21,7 @@ use crate::core::color::detect_color;
 use crate::core::frontend::PANEL_OFFSET_X;
 use crate::core::html_text;
 use crate::core::i18n_keys::I18nKey;
+use crate::core::rtf_text;
 use crate::core::transfer_types::{
     TRANSFER_STATUS_CLOUD_UID, TRANSFER_STATUS_DOWNLOADING_UID, TRANSFER_STATUS_LOCAL_UID,
     TRANSFER_STATUS_PINNED_UID, TRANSFER_STATUS_RETENTION_UID,
@@ -521,6 +522,52 @@ mod info_row_tests {
     }
 }
 
+#[cfg(test)]
+mod rtf_preview_tests {
+    use super::{rich_preview, RichPreview};
+    use crate::core::types::{ClipboardItem, ContentType, RichData};
+
+    fn rich_item(text: &str, rich: RichData) -> ClipboardItem {
+        ClipboardItem::new_text(1, text, ContentType::RichText, None, Some(&rich))
+    }
+
+    /// RTF is the richer representation of the entry, so it wins over the
+    /// plain-text flavour — symmetrically with HTML. The payload is decoded with
+    /// the document's own escapes (`core::rtf_text`).
+    #[test]
+    fn rtf_payload_wins_over_the_plain_text_flavour() {
+        let item = rich_item(
+            "plain text flavour",
+            RichData {
+                rtf: Some(r"{\rtf1\ansi\uc1\u38169?\u35823?} detail".to_string()),
+                ..Default::default()
+            },
+        );
+
+        match rich_preview(&item) {
+            RichPreview::Markdown(text) => assert_eq!(text, "错误 detail"),
+            _ => panic!("expected RTF preview"),
+        }
+    }
+
+    /// An RTF payload with no readable content keeps the captured plain text.
+    #[test]
+    fn rtf_without_text_falls_back_to_full_text() {
+        let item = rich_item(
+            "fallback text",
+            RichData {
+                rtf: Some("{\\rtf1\\ansi\\b\\i\\ul}".to_string()),
+                ..Default::default()
+            },
+        );
+
+        match rich_preview(&item) {
+            RichPreview::Plain(text) => assert_eq!(text, "fallback text"),
+            _ => panic!("expected plain text fallback"),
+        }
+    }
+}
+
 /// Get a content type iconfont glyph for display.
 fn type_icon(item: &ClipboardItem) -> &'static str {
     // Use meta-type specific icons for email and phone
@@ -1007,10 +1054,10 @@ fn rich_preview(item: &ClipboardItem) -> RichPreview {
             // the `TextView::html` fallback.
             let normalized = rich_preview::normalize_clipboard_html_for_render(&raw_html);
             let visible_text = html_text::visible_text(&normalized);
-            // Defensive fallback chain (HTML → RTF → plain text): when the
-            // HTML fragment carries no visible text (empty fragment,
-            // metadata-only body, unparseable markup), try the same item's
-            // RTF before giving up on the reliable plain-text copy.
+            // Defensive fallback chain (HTML → RTF → plain text): when the HTML
+            // fragment carries no visible text (empty fragment, metadata-only
+            // body, unparseable markup), try the same item's RTF payload before
+            // giving up on the reliable plain-text copy.
             if visible_text.is_empty() {
                 return rtf_fallback_preview(&rich, item);
             }
@@ -1030,97 +1077,22 @@ fn rich_preview(item: &ClipboardItem) -> RichPreview {
     }
 }
 
-/// Preview an item's RTF payload as plain text, falling back to the item's
-/// plain text when the RTF is absent or carries no readable content.
+/// Preview for a rich item whose formatted payload carries no renderable HTML:
+/// decode the RTF payload, falling back to the captured plain text when the RTF
+/// is absent or carries no readable content.
+///
+/// RTF is the richer representation, so it wins for an RTF entry (symmetrically
+/// with HTML); the plain text (`CF_UNICODETEXT`) is authoritative only when the
+/// decoder has nothing to work with. Decoding must resolve the document's code
+/// page — see `core::rtf_text` and issue #114.
 fn rtf_fallback_preview(rich: &RichData, item: &ClipboardItem) -> RichPreview {
-    if let Some(rtf) = rich.rtf.as_deref().filter(|r| !r.trim().is_empty()) {
-        let plain = rtf_to_plain_text(rtf);
+    if let Some(rtf) = rich.rtf.as_deref().filter(|rtf| !rtf.trim().is_empty()) {
+        let plain = rtf_text::rtf_to_plain_text(rtf);
         if !plain.is_empty() {
             return RichPreview::Markdown(plain);
         }
     }
     RichPreview::Plain(item.full_text.clone())
-}
-
-fn rtf_to_plain_text(rtf: &str) -> String {
-    let mut out = String::new();
-    let mut chars = rtf.chars().peekable();
-    let mut group_depth_to_skip: Option<usize> = None;
-    let mut depth = 0usize;
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '{' => {
-                depth += 1;
-                if matches!(chars.peek(), Some('\\')) {
-                    let mut probe = chars.clone();
-                    let _ = probe.next();
-                    if matches!(probe.peek(), Some('*')) {
-                        group_depth_to_skip = Some(depth);
-                    }
-                }
-            }
-            '}' => {
-                if group_depth_to_skip == Some(depth) {
-                    group_depth_to_skip = None;
-                }
-                depth = depth.saturating_sub(1);
-            }
-            '\\' if group_depth_to_skip.is_none() => match chars.peek().copied() {
-                Some('\\' | '{' | '}') => {
-                    if let Some(escaped) = chars.next() {
-                        out.push(escaped);
-                    }
-                }
-                Some('\'') => {
-                    let _ = chars.next();
-                    let hi = chars.next();
-                    let lo = chars.next();
-                    if let (Some(hi), Some(lo)) = (hi, lo) {
-                        let hex = format!("{hi}{lo}");
-                        if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                            out.push(byte as char);
-                        }
-                    }
-                }
-                _ => {
-                    let mut word = String::new();
-                    while let Some(next) = chars.peek().copied() {
-                        if next.is_ascii_alphabetic() {
-                            word.push(next);
-                            let _ = chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    while let Some(next) = chars.peek().copied() {
-                        if next == '-' || next.is_ascii_digit() {
-                            let _ = chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    if matches!(chars.peek(), Some(' ')) {
-                        let _ = chars.next();
-                    }
-                    match word.as_str() {
-                        "par" | "line" => out.push('\n'),
-                        "tab" => out.push('\t'),
-                        _ => {}
-                    }
-                }
-            },
-            _ if group_depth_to_skip.is_none() => out.push(ch),
-            _ => {}
-        }
-    }
-
-    out.lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
 }
 
 fn card_content_matches_search(item: &ClipboardItem, terms: &[String]) -> bool {
