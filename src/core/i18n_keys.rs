@@ -7,14 +7,19 @@ use crate::define_i18n;
 
 define_i18n! {
     GroupLocalBackup: ("本地备份与恢复", "Local backup and restore"),
-    DescLocalBackup: ("全量保存设置、历史、标签、图片和文件缓存", "Save all settings, history, tags, images and cached files"),
+    DescLocalBackup: ("按需备份或恢复设置和剪贴板数据", "Select settings and clipboard data to back up or restore"),
+    BackupContents: ("选择备份内容", "Choose backup contents"),
+    RestoreContents: ("选择恢复内容", "Choose restore contents"),
+    BackupSettings: ("设置", "Settings"),
+    BackupData: ("剪贴板数据", "Clipboard data"),
+    BackupSelectRequired: ("请至少选择一项内容", "Select at least one component"),
+    RestoreSelectedAction: ("恢复并重启", "Restore and restart"),
     BtnLocalBackup: ("备份", "Backup"),
     BtnLocalRestore: ("恢复", "Restore"),
     LocalBackupBusy: ("正在处理…", "Working…"),
     LocalBackupDone: ("备份成功", "Backup successful"),
     LocalBackupFailed: ("备份失败，请检查保存位置和可用空间", "Backup failed; check the save location and available space"),
     LocalRestoreFailed: ("恢复失败，请检查备份是否完整有效", "Restore failed; check that the backup is complete and valid"),
-    LocalRestoreConfirm: ("恢复后将替换全部设置和数据并重启应用。当前数据会保留在原目录。确定继续？", "Restore all settings and data and restart Clippi? Current data will remain in its original directory."),
     // ─── App ───
     AppName:            ("Clippi 剪贴板", "Clippi Clipboard"),
 

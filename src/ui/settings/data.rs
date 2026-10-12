@@ -14,6 +14,16 @@ use crate::ui::font::fs;
 use crate::ui::settings::SettingsEvent;
 
 use super::SettingsPanel;
+use crate::core::backup::{BackupContents, PreparedRestore};
+use crate::ui::components::app_list_dialog::{render_app_list_dialog, AppListDialogParams};
+use std::rc::Rc;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct LocalBackupDialog {
+    selected: BackupContents,
+    prepared: Option<Arc<PreparedRestore>>,
+}
 
 /// Which storage mode the reset dialog should target.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,64 +50,126 @@ impl SettingsPanel {
         if self.local_backup_busy || self.window_manager.read(cx).is_maintenance_running() {
             return;
         }
+        self.close_app_list_popups();
+        if !restore {
+            self.local_backup_dialog = Some(LocalBackupDialog {
+                selected: BackupContents::default(),
+                prepared: None,
+            });
+            cx.notify();
+            return;
+        }
         self.local_backup_busy = true;
+        let generation = self.local_backup_dialog_generation;
+        let guard = self.window_manager.read(cx).suspend_auto_hide_for_dialog();
         cx.notify();
-        let settings = self.state.read(cx).settings.clone();
-        let dialog_guard = self.window_manager.read(cx).suspend_auto_hide_for_dialog();
         self._local_backup_task = Some(cx.spawn(async move |weak, cx| {
-            let result = async {
-                let dialog = rfd::AsyncFileDialog::new()
-                    .add_filter("Clippi ZIP", &["zip"])
-                    .set_title(if restore {
-                        I18nKey::BtnLocalRestore.text()
-                    } else {
-                        I18nKey::BtnLocalBackup.text()
-                    });
-                let selected = if restore {
-                    dialog.pick_file().await
-                } else {
-                    dialog
-                        .set_file_name(format!(
-                            "clippi-backup-{}.zip",
-                            chrono::Local::now().format("%Y%m%d-%H%M%S")
-                        ))
-                        .save_file()
-                        .await
-                };
-                let Some(file) = selected else {
-                    return Ok(None);
-                };
-                if restore {
-                    let answer = rfd::AsyncMessageDialog::new()
-                        .set_title(I18nKey::BtnLocalRestore.text())
-                        .set_description(I18nKey::LocalRestoreConfirm.text())
-                        .set_level(rfd::MessageLevel::Warning)
-                        .set_buttons(rfd::MessageButtons::OkCancel)
-                        .show()
-                        .await;
-                    if answer != rfd::MessageDialogResult::Ok {
-                        return Ok(None);
-                    }
-                }
+            let selected = rfd::AsyncFileDialog::new()
+                .add_filter("Clippi ZIP", &["zip"])
+                .set_title(I18nKey::BtnLocalRestore.text())
+                .pick_file()
+                .await;
+            drop(guard);
+            let result = if let Some(file) = selected {
                 let path = file.path().to_path_buf();
-                drop(dialog_guard);
-                let result = cx
-                    .background_spawn(async move {
-                        if restore {
-                            crate::core::backup::restore(&path, &settings).map(Some)
-                        } else {
-                            crate::core::backup::create(&settings, &path).map(|()| None)
-                        }
-                    })
-                    .await;
-                result.map(Some)
-            }
-            .await;
+                Some(
+                    cx.background_spawn(async move { crate::core::backup::prepare_restore(&path) })
+                        .await,
+                )
+            } else {
+                None
+            };
             if let Some(panel) = weak.upgrade() {
                 let _ = panel.update(cx, |panel, cx| {
                     panel.local_backup_busy = false;
                     match result {
-                        Ok(Some(Some(settings))) => {
+                        Some(Ok(prepared))
+                            if panel.local_backup_dialog_generation == generation
+                                && panel.active_tab() == 3 =>
+                        {
+                            panel.local_backup_dialog = Some(LocalBackupDialog {
+                                selected: prepared.contents(),
+                                prepared: Some(Arc::new(prepared)),
+                            });
+                        }
+                        Some(Err(error)) => {
+                            log::error!("Read local backup failed: {error}");
+                            cx.emit(SettingsEvent::DataError(
+                                I18nKey::LocalRestoreFailed.text().to_owned(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+    }
+
+    fn confirm_local_backup(&mut self, cx: &mut Context<Self>) {
+        if self.local_backup_busy || self.window_manager.read(cx).is_maintenance_running() {
+            return;
+        }
+        let Some(dialog) = self.local_backup_dialog.as_ref() else {
+            return;
+        };
+        if dialog.selected.is_empty() {
+            cx.emit(SettingsEvent::DataToast(
+                I18nKey::BackupSelectRequired.text().to_owned(),
+            ));
+            return;
+        }
+        let dialog = self
+            .local_backup_dialog
+            .take()
+            .expect("backup dialog exists");
+        self.close_app_list_popups();
+        self.local_backup_busy = true;
+        let settings = self.state.read(cx).settings.clone();
+        let restore = dialog.prepared.is_some();
+        let guard = if restore {
+            None
+        } else {
+            Some(self.window_manager.read(cx).suspend_auto_hide_for_dialog())
+        };
+        cx.notify();
+        self._local_backup_task = Some(cx.spawn(async move |weak, cx| {
+            let result = if let Some(prepared) = dialog.prepared {
+                Some(
+                    cx.background_spawn(async move {
+                        prepared.restore(&settings, dialog.selected).map(Some)
+                    })
+                    .await,
+                )
+            } else {
+                let file = rfd::AsyncFileDialog::new()
+                    .add_filter("Clippi ZIP", &["zip"])
+                    .set_title(I18nKey::BtnLocalBackup.text())
+                    .set_file_name(format!(
+                        "clippi-backup-{}.zip",
+                        chrono::Local::now().format("%Y%m%d-%H%M%S")
+                    ))
+                    .save_file()
+                    .await;
+                drop(guard);
+                if let Some(file) = file {
+                    let path = file.path().to_path_buf();
+                    Some(
+                        cx.background_spawn(async move {
+                            crate::core::backup::create_selected(&settings, &path, dialog.selected)
+                                .map(|()| None)
+                        })
+                        .await,
+                    )
+                } else {
+                    None
+                }
+            };
+            if let Some(panel) = weak.upgrade() {
+                let _ = panel.update(cx, |panel, cx| {
+                    panel.local_backup_busy = false;
+                    match result {
+                        Some(Ok(Some(settings))) => {
                             let previous = panel.state.read(cx).settings.clone();
                             let commit =
                                 settings.save_atomic_to(&crate::core::paths::config_path());
@@ -108,8 +180,6 @@ impl SettingsPanel {
                                 }
                                 Err(error) => {
                                     log::error!("Local restore commit/restart failed: {error}");
-                                    // A failed restart must not leave the running app pointing
-                                    // at different data on its next settings save.
                                     if let Err(rollback) =
                                         previous.save_atomic_to(&crate::core::paths::config_path())
                                     {
@@ -121,11 +191,10 @@ impl SettingsPanel {
                                 }
                             }
                         }
-                        Ok(Some(None)) => cx.emit(SettingsEvent::DataToast(
+                        Some(Ok(None)) => cx.emit(SettingsEvent::DataToast(
                             I18nKey::LocalBackupDone.text().to_owned(),
                         )),
-                        Ok(None) => {}
-                        Err(error) => {
+                        Some(Err(error)) => {
                             log::error!("Local backup/restore failed: {error}");
                             cx.emit(SettingsEvent::DataError(
                                 if restore {
@@ -136,6 +205,7 @@ impl SettingsPanel {
                                 .to_owned(),
                             ));
                         }
+                        None => {}
                     }
                     cx.notify();
                 });
@@ -143,6 +213,113 @@ impl SettingsPanel {
         }));
     }
 
+    pub fn render_local_backup_dialog_overlay(
+        panel: Entity<Self>,
+        theme: crate::ui::theme::ClippiTheme,
+        layout: (f32, f32, f32, f32, f32),
+        cx: &App,
+    ) -> impl IntoElement {
+        let Some(dialog) = panel.read(cx).local_backup_dialog.clone() else {
+            return div().into_any_element();
+        };
+        let available = dialog
+            .prepared
+            .as_ref()
+            .map_or(BackupContents::default(), |prepared| prepared.contents());
+        let restore = dialog.prepared.is_some();
+        let mut rows = Vec::new();
+        for (settings, enabled, checked, label) in [
+            (
+                true,
+                available.settings,
+                dialog.selected.settings,
+                I18nKey::BackupSettings,
+            ),
+            (
+                false,
+                available.data,
+                dialog.selected.data,
+                I18nKey::BackupData,
+            ),
+        ] {
+            if !enabled {
+                continue;
+            }
+            let action_panel = panel.clone();
+            let hover = theme.btn_hover;
+            rows.push(
+                crate::ui::type_filter_config::selectable_type_row(
+                    "",
+                    label.text().to_owned(),
+                    checked,
+                    &theme,
+                )
+                .id(if settings {
+                    "backup-settings"
+                } else {
+                    "backup-data"
+                })
+                .h(px(32. * layout.1))
+                .cursor(CursorStyle::PointingHand)
+                .hover(move |style| style.bg(hover))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    action_panel.update(cx, |panel, cx| {
+                        if let Some(dialog) = panel.local_backup_dialog.as_mut() {
+                            if settings {
+                                dialog.selected.settings = !dialog.selected.settings;
+                            } else {
+                                dialog.selected.data = !dialog.selected.data;
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .into_any_element(),
+            );
+        }
+        let close_panel = panel.clone();
+        render_app_list_dialog(AppListDialogParams {
+            title: if restore {
+                I18nKey::RestoreContents.text()
+            } else {
+                I18nKey::BackupContents.text()
+            }
+            .to_owned(),
+            empty_hint: String::new(),
+            entries: Vec::new(),
+            custom_rows: Some(rows),
+            configured_count: Some(dialog.selected.count()),
+            scroll_key: "local-backup-popup",
+            recording_app: None,
+            show_shortcut_column: false,
+            help_text: None,
+            add_button_label: Some(
+                if restore {
+                    I18nKey::RestoreSelectedAction.text()
+                } else {
+                    I18nKey::BtnLocalBackup.text()
+                }
+                .to_owned(),
+            ),
+            add_button_recording: false,
+            theme,
+            layout,
+            on_close: Rc::new(move |_, cx| {
+                close_panel.update(cx, |panel, cx| {
+                    panel.close_app_list_popups();
+                    cx.notify();
+                })
+            }),
+            on_delete: Rc::new(|_, _, _| {}),
+            on_shortcut_click: None,
+            on_cancel_recording: None,
+            on_add: Some(Rc::new(move |_, cx| {
+                panel.update(cx, |panel, cx| panel.confirm_local_backup(cx))
+            })),
+        })
+        .into_any_element()
+    }
     /// Enter editing mode for the max-items field.
     fn start_edit_max_items(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.state.read(cx).settings.max_items;

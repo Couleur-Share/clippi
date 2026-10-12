@@ -540,6 +540,11 @@ impl RootView {
             cx.observe(&backend_panel, |_this, _, cx| {
                 cx.notify();
             }),
+            // Settings owns the selection state; its list popup is rendered
+            // here so changes must also invalidate the root overlay.
+            cx.observe(&settings_panel, |_this, _, cx| {
+                cx.notify();
+            }),
             cx.subscribe(
                 &list_view,
                 move |this, _list, event: &ClipboardListEvent, cx| match event {
@@ -968,6 +973,9 @@ impl Render for RootView {
         let privacy_popup_visible = is_settings
             && active_settings_tab == 1
             && self.settings_panel.read(cx).privacy_types_popup_open;
+        let local_backup_popup_visible = is_settings
+            && active_settings_tab == 3
+            && self.settings_panel.read(cx).local_backup_dialog.is_some();
         let transfer_refreshing = is_clipboard && {
             let state = self.state.read(cx);
             state.transfer_filter_active && state.transfer_refreshing
@@ -1026,6 +1034,9 @@ impl Render for RootView {
         let privacy_popup_gen =
             self.overlay_generation("privacy-types-popup", privacy_popup_visible);
         let privacy_popup_animating = self.overlay_animating("privacy-types-popup");
+        let local_backup_popup_gen =
+            self.overlay_generation("local-backup-popup", local_backup_popup_visible);
+        let local_backup_popup_animating = self.overlay_animating("local-backup-popup");
 
         let tag_panel_animating = self.overlay_animating("tag-filter");
         let filter_config_animating = self.overlay_animating("type-filter-config");
@@ -1298,6 +1309,18 @@ impl Render for RootView {
         } else {
             (1., 1., 0., win_w, win_h)
         };
+        let local_backup_popup_layout =
+            if local_backup_popup_visible && local_backup_popup_animating {
+                (
+                    Self::overlay_opacity(window, cx, local_backup_popup_gen, "local-backup-popup"),
+                    Self::overlay_scale(window, cx, local_backup_popup_gen, "local-backup-popup"),
+                    Self::overlay_offset(window, cx, local_backup_popup_gen, "local-backup-popup"),
+                    win_w,
+                    win_h,
+                )
+            } else {
+                (1., 1., 0., win_w, win_h)
+            };
 
         let sidebar_for_escape = self.sidebar.clone();
         let filter_config_for_escape = self.type_filter_config_panel.clone();
@@ -2318,6 +2341,11 @@ impl Render for RootView {
                     on_cancel_recording: None,
                     on_add: None,
                 }))
+            })
+            .when(local_backup_popup_visible, |root| {
+                root.child(SettingsPanel::render_local_backup_dialog_overlay(
+                    self.settings_panel.clone(), self.theme.clone(), local_backup_popup_layout, cx,
+                ))
             })
             // --- Root-level clear-data ConfirmDialog ---
             .when(clear_data_confirm_visible, |root| {

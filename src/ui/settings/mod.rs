@@ -29,6 +29,7 @@ mod version;
 
 const TAB_ANIM_DURATION: Duration = Duration::from_millis(160);
 
+use data::LocalBackupDialog;
 use data::ResetDataDirState;
 use hotkey::HotkeyConfirmAction;
 
@@ -112,6 +113,8 @@ pub struct SettingsPanel {
     /// Pending async file dialog for changing the database path.
     _db_path_dialog_task: Option<Task<()>>,
     local_backup_busy: bool,
+    pub local_backup_dialog: Option<LocalBackupDialog>,
+    local_backup_dialog_generation: u64,
     _local_backup_task: Option<Task<()>>,
     /// Focus-out subscription for the max-items input (auto-save on blur).
     _max_items_focus_sub: gpui::Subscription,
@@ -251,6 +254,8 @@ impl SettingsPanel {
             max_items_input,
             _db_path_dialog_task: None,
             local_backup_busy: false,
+            local_backup_dialog: None,
+            local_backup_dialog_generation: 0,
             _local_backup_task: None,
             _max_items_focus_sub,
             editing_retention_days: false,
@@ -281,6 +286,9 @@ impl SettingsPanel {
     /// Switch to a specific tab by index.
     pub fn set_active_tab(&mut self, index: usize) {
         if self.active_tab != index {
+            self.local_backup_dialog = None;
+            self.local_backup_dialog_generation =
+                self.local_backup_dialog_generation.wrapping_add(1);
             self.active_tab = index;
             self.tab_transition_generation = self.tab_transition_generation.wrapping_add(1);
             self.tab_transition_started = Some(Instant::now());
@@ -292,7 +300,8 @@ impl SettingsPanel {
     }
 
     pub fn app_list_popup_open(&self) -> bool {
-        self.privacy_types_popup_open
+        self.local_backup_dialog.is_some()
+            || self.privacy_types_popup_open
             || self.app_blacklist_popup_open
             || self.hotkey_blacklist_popup_open
             || self.paste_shortcuts_popup_open
@@ -300,6 +309,8 @@ impl SettingsPanel {
     }
 
     pub fn close_app_list_popups(&mut self) {
+        self.local_backup_dialog = None;
+        self.local_backup_dialog_generation = self.local_backup_dialog_generation.wrapping_add(1);
         self.hotkey_blacklist_popup_open = false;
         self.paste_shortcuts_popup_open = false;
         self.app_blacklist_popup_open = false;

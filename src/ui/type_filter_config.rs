@@ -431,17 +431,19 @@ pub(crate) fn selectable_type_row(
                 .flex_shrink_0()
                 .child(if visible { "\u{e61f}" } else { "\u{e831}" }),
         )
+        .when(!icon.is_empty(), |row| {
+            row.child(
+                div()
+                    .ml(px(6.))
+                    .text_size(fs(12.))
+                    .font_family("iconfont")
+                    .text_color(if visible { theme.text_2 } else { theme.text_3 })
+                    .child(icon.to_string()),
+            )
+        })
         .child(
             div()
-                .ml(px(6.))
-                .text_size(fs(12.))
-                .font_family("iconfont")
-                .text_color(if visible { theme.text_2 } else { theme.text_3 })
-                .child(icon.to_string()),
-        )
-        .child(
-            div()
-                .ml(px(4.))
+                .ml(px(if icon.is_empty() { 6. } else { 4. }))
                 .text_size(fs(11.))
                 .flex_1()
                 .text_color(if visible { theme.text_1 } else { theme.text_3 })

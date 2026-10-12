@@ -1,4 +1,4 @@
-//! Full local backups. Restore into a new directory before switching settings;
+//! Selective local backups. Restore data into a new directory before switching settings;
 //! the live database and the original data are never overwritten.
 use super::settings::AppSettings;
 use rusqlite::{params, Connection, OpenFlags};
@@ -9,11 +9,47 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupContents {
+    pub settings: bool,
+    pub data: bool,
+}
+
+impl Default for BackupContents {
+    fn default() -> Self {
+        Self {
+            settings: true,
+            data: true,
+        }
+    }
+}
+
+impl BackupContents {
+    pub fn is_empty(self) -> bool {
+        !self.settings && !self.data
+    }
+    pub fn count(self) -> usize {
+        usize::from(self.settings) + usize::from(self.data)
+    }
+    fn validate_selection(self, available: Self) -> Result<(), String> {
+        if self.is_empty()
+            || (self.settings && !available.settings)
+            || (self.data && !available.data)
+        {
+            Err("Select at least one available backup component".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     version: u32,
     data_dir: PathBuf,
     files: BTreeMap<String, String>,
+    #[serde(default)]
+    contents: BackupContents,
 }
 
 fn zip_tree(
@@ -50,7 +86,12 @@ fn zip_tree(
 }
 
 /// Write one ZIP backup, replacing an existing destination only after success.
-pub fn create(settings: &AppSettings, destination: &Path) -> Result<(), String> {
+pub fn create_selected(
+    settings: &AppSettings,
+    destination: &Path,
+    contents: BackupContents,
+) -> Result<(), String> {
+    contents.validate_selection(BackupContents::default())?;
     let parent = destination
         .parent()
         .ok_or("Backup has no parent directory")?;
@@ -72,7 +113,7 @@ pub fn create(settings: &AppSettings, destination: &Path) -> Result<(), String> 
         return Err("Choose a backup location outside the image/file cache".into());
     }
     let staging = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let snapshot = create_folder(settings, staging.path())?;
+    let snapshot = create_folder_selected(settings, staging.path(), contents)?;
     let temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipWriter::new(temporary.reopen().map_err(|e| e.to_string())?);
     zip_tree(&snapshot, &snapshot, &mut archive)?;
@@ -120,11 +161,49 @@ fn extract(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Unpack, validate, and stage a ZIP backup without changing the running app.
-pub fn restore(source: &Path, current: &AppSettings) -> Result<AppSettings, String> {
+/// An extracted, validated backup kept alive while the user chooses contents.
+pub struct PreparedRestore {
+    staging: tempfile::TempDir,
+    contents: BackupContents,
+}
+
+impl PreparedRestore {
+    pub fn contents(&self) -> BackupContents {
+        self.contents
+    }
+    pub fn restore(
+        &self,
+        current: &AppSettings,
+        selected: BackupContents,
+    ) -> Result<AppSettings, String> {
+        restore_folder_selected(self.staging.path(), current, selected)
+    }
+}
+
+pub fn prepare_restore(source: &Path) -> Result<PreparedRestore, String> {
     let staging = tempfile::tempdir().map_err(|e| e.to_string())?;
     extract(source, staging.path())?;
-    restore_folder(staging.path(), current)
+    let manifest = validate_snapshot(staging.path())?;
+    Ok(PreparedRestore {
+        staging,
+        contents: manifest.contents,
+    })
+}
+
+#[cfg(test)]
+fn create(settings: &AppSettings, destination: &Path) -> Result<(), String> {
+    create_selected(settings, destination, BackupContents::default())
+}
+
+#[cfg(test)]
+fn restore(source: &Path, current: &AppSettings) -> Result<AppSettings, String> {
+    let prepared = prepare_restore(source)?;
+    prepared.restore(current, prepared.contents())
+}
+
+#[cfg(test)]
+fn create_folder(settings: &AppSettings, parent: &Path) -> Result<PathBuf, String> {
+    create_folder_selected(settings, parent, BackupContents::default())
 }
 
 fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
@@ -181,7 +260,11 @@ fn inventory(root: &Path, dir: &Path, files: &mut BTreeMap<String, String>) -> R
 }
 
 /// Create a private snapshot folder to package into an archive.
-fn create_folder(settings: &AppSettings, parent: &Path) -> Result<PathBuf, String> {
+fn create_folder_selected(
+    settings: &AppSettings,
+    parent: &Path,
+    contents: BackupContents,
+) -> Result<PathBuf, String> {
     let db = settings.resolve_db_path();
     let data = db.parent().ok_or("Database has no parent directory")?;
     let source = fs::canonicalize(data).map_err(|e| e.to_string())?;
@@ -198,30 +281,35 @@ fn create_folder(settings: &AppSettings, parent: &Path) -> Result<PathBuf, Strin
     ));
     fs::create_dir(&target).map_err(|e| e.to_string())?;
     let result = (|| {
-        settings.save_atomic_to(&target.join("clippi.toml"))?;
-        let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        if contents.settings {
+            settings.save_atomic_to(&target.join("clippi.toml"))?;
+        }
+        if contents.data {
+            let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| e.to_string())?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| e.to_string())?;
+            // VACUUM INTO captures a consistent SQLite snapshot, including WAL data.
+            conn.execute(
+                "VACUUM INTO ?1",
+                [target.join("clippi.db").to_string_lossy().as_ref()],
+            )
             .map_err(|e| e.to_string())?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| e.to_string())?;
-        // VACUUM INTO captures a consistent SQLite snapshot, including WAL data.
-        conn.execute(
-            "VACUUM INTO ?1",
-            [target.join("clippi.db").to_string_lossy().as_ref()],
-        )
-        .map_err(|e| e.to_string())?;
-        for cache in ["images", "file_cache"] {
-            if data.join(cache).exists() {
-                copy_tree(&data.join(cache), &target.join(cache))?;
-            } else {
-                fs::create_dir(target.join(cache)).map_err(|e| e.to_string())?;
+            for cache in ["images", "file_cache"] {
+                if data.join(cache).exists() {
+                    copy_tree(&data.join(cache), &target.join(cache))?;
+                } else {
+                    fs::create_dir(target.join(cache)).map_err(|e| e.to_string())?;
+                }
             }
         }
         let mut files = BTreeMap::new();
         inventory(&target, &target, &mut files)?;
         let manifest = Manifest {
-            version: 1,
+            version: 2,
             data_dir: data.to_path_buf(),
             files,
+            contents,
         };
         fs::write(
             target.join("manifest.json"),
@@ -279,26 +367,44 @@ fn remap_json(value: &mut serde_json::Value, old: &Path, new: &Path) {
     }
 }
 
-/// Validate and stage a complete restore. Caller commits settings and restarts.
-fn restore_folder(source: &Path, current: &AppSettings) -> Result<AppSettings, String> {
-    let source = fs::canonicalize(source).map_err(|e| e.to_string())?;
+/// Check the full archive inventory and its advertised contents.
+fn validate_snapshot(source: &Path) -> Result<Manifest, String> {
     let manifest: Manifest =
         serde_json::from_slice(&fs::read(source.join("manifest.json")).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-    if manifest.version != 1 {
+    if !matches!(manifest.version, 1 | 2) || manifest.contents.is_empty() {
         return Err("Unsupported backup version".into());
     }
     let mut files = BTreeMap::new();
-    inventory(&source, &source, &mut files)?;
+    inventory(source, source, &mut files)?;
     if files != manifest.files
-        || !files.contains_key("clippi.db")
-        || !files.contains_key("clippi.toml")
+        || (manifest.contents.data && !files.contains_key("clippi.db"))
+        || (manifest.contents.settings && !files.contains_key("clippi.toml"))
     {
         return Err("Backup is incomplete or its files have changed".into());
     }
-    let mut settings: AppSettings =
+    Ok(manifest)
+}
+
+fn restore_folder_selected(
+    source: &Path,
+    current: &AppSettings,
+    selected: BackupContents,
+) -> Result<AppSettings, String> {
+    let source = fs::canonicalize(source).map_err(|e| e.to_string())?;
+    let manifest = validate_snapshot(&source)?;
+    selected.validate_selection(manifest.contents)?;
+    let mut settings: AppSettings = if selected.settings {
         toml::from_str(&fs::read_to_string(source.join("clippi.toml")).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+    } else {
+        current.clone()
+    };
+    // Storage location belongs to the active data, never to settings alone.
+    settings.db_path = current.db_path.clone();
+    if !selected.data {
+        return Ok(settings);
+    }
     let db = current.resolve_db_path();
     let parent = db.parent().ok_or("Database has no parent directory")?;
     let parent = fs::canonicalize(parent).map_err(|e| e.to_string())?;
@@ -319,6 +425,11 @@ fn restore_folder(source: &Path, current: &AppSettings) -> Result<AppSettings, S
         if staged_files != manifest.files {
             return Err("Backup changed while restoring".into());
         }
+        // Only the selected data is retained in the restored directory.
+        if target.join("clippi.toml").exists() {
+            fs::remove_file(target.join("clippi.toml")).map_err(|e| e.to_string())?;
+        }
+        fs::remove_file(target.join("manifest.json")).map_err(|e| e.to_string())?;
         let conn = Connection::open(target.join("clippi.db")).map_err(|e| e.to_string())?;
         let integrity: String = conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -380,6 +491,190 @@ fn restore_folder(source: &Path, current: &AppSettings) -> Result<AppSettings, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selective_fixture() -> (tempfile::TempDir, AppSettings, AppSettings) {
+        let root = tempfile::tempdir().unwrap();
+        let backup_dir = root.path().join("backup-data");
+        let current_dir = root.path().join("current-data");
+        fs::create_dir_all(backup_dir.join("images")).unwrap();
+        fs::create_dir_all(backup_dir.join("file_cache")).unwrap();
+        fs::create_dir_all(&current_dir).unwrap();
+        fs::write(backup_dir.join("images").join("image.png"), b"image").unwrap();
+        fs::write(backup_dir.join("file_cache").join("file.txt"), b"file").unwrap();
+        let backup = AppSettings {
+            db_path: backup_dir.join("clippi.db").to_string_lossy().into_owned(),
+            max_items: 543,
+            ..AppSettings::default()
+        };
+        let current = AppSettings {
+            db_path: current_dir.join("clippi.db").to_string_lossy().into_owned(),
+            max_items: 987,
+            ..AppSettings::default()
+        };
+        for (settings, text) in [(&backup, "backup history"), (&current, "current history")] {
+            let database = super::super::db::Database::open(&settings.db_path).unwrap();
+            let connection = Connection::open(&settings.db_path).unwrap();
+            connection.execute("INSERT INTO clipboard_items (full_text, content_hash, created_at, updated_at) VALUES (?1, 42, 'now', 'now')", [text]).unwrap();
+            drop(connection);
+            drop(database);
+        }
+        (root, backup, current)
+    }
+
+    fn history(settings: &AppSettings) -> String {
+        Connection::open(&settings.db_path)
+            .unwrap()
+            .query_row("SELECT full_text FROM clipboard_items", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn one_archive_supports_selective_restore_without_changing_unselected_contents() {
+        let (root, backup, current) = selective_fixture();
+        let zip = root.path().join("full.zip");
+        create(&backup, &zip).unwrap();
+        let prepared = prepare_restore(&zip).unwrap();
+        assert_eq!(prepared.contents(), BackupContents::default());
+        let settings_only = prepared
+            .restore(
+                &current,
+                BackupContents {
+                    settings: true,
+                    data: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(settings_only.max_items, backup.max_items);
+        assert_eq!(settings_only.db_path, current.db_path);
+        assert_eq!(history(&settings_only), "current history");
+        let data_only = prepared
+            .restore(
+                &current,
+                BackupContents {
+                    settings: false,
+                    data: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(data_only.max_items, current.max_items);
+        assert_eq!(history(&data_only), "backup history");
+        let data_dir = Path::new(&data_only.db_path).parent().unwrap();
+        assert_eq!(
+            fs::read(data_dir.join("images").join("image.png")).unwrap(),
+            b"image"
+        );
+        assert_eq!(
+            fs::read(data_dir.join("file_cache").join("file.txt")).unwrap(),
+            b"file"
+        );
+        assert!(!data_dir.join("clippi.toml").exists());
+        let both = prepared
+            .restore(&current, BackupContents::default())
+            .unwrap();
+        assert_eq!(both.max_items, backup.max_items);
+        assert_eq!(history(&both), "backup history");
+        assert_eq!(history(&current), "current history");
+        assert_eq!(history(&backup), "backup history");
+    }
+
+    #[test]
+    fn partial_archives_only_include_selected_payloads_and_reject_unavailable_selections() {
+        let (root, backup, current) = selective_fixture();
+        for contents in [
+            BackupContents {
+                settings: true,
+                data: false,
+            },
+            BackupContents {
+                settings: false,
+                data: true,
+            },
+        ] {
+            let zip = root
+                .path()
+                .join(format!("partial-{}.zip", contents.settings));
+            create_selected(&backup, &zip, contents).unwrap();
+            let mut archive = zip::ZipArchive::new(fs::File::open(&zip).unwrap()).unwrap();
+            assert_eq!(archive.by_name("clippi.toml").is_ok(), contents.settings);
+            assert_eq!(archive.by_name("clippi.db").is_ok(), contents.data);
+            assert_eq!(archive.by_name("images/image.png").is_ok(), contents.data);
+            drop(archive);
+            let prepared = prepare_restore(&zip).unwrap();
+            assert_eq!(prepared.contents(), contents);
+            let restored = prepared.restore(&current, contents).unwrap();
+            assert_eq!(
+                restored.max_items,
+                if contents.settings {
+                    backup.max_items
+                } else {
+                    current.max_items
+                }
+            );
+            assert_eq!(
+                history(&restored),
+                if contents.data {
+                    "backup history"
+                } else {
+                    "current history"
+                }
+            );
+            assert!(prepared
+                .restore(&current, BackupContents::default())
+                .is_err());
+            assert!(prepared
+                .restore(
+                    &current,
+                    BackupContents {
+                        settings: false,
+                        data: false
+                    }
+                )
+                .is_err());
+        }
+        let empty = root.path().join("empty.zip");
+        assert!(create_selected(
+            &backup,
+            &empty,
+            BackupContents {
+                settings: false,
+                data: false
+            }
+        )
+        .is_err());
+        assert!(!empty.exists());
+    }
+
+    #[test]
+    fn legacy_full_archives_can_restore_only_settings() {
+        let (root, backup, current) = selective_fixture();
+        let snapshot = create_folder(&backup, root.path()).unwrap();
+        let manifest_path = snapshot.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["version"] = 1.into();
+        manifest.as_object_mut().unwrap().remove("contents");
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let zip = root.path().join("legacy.zip");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
+        zip_tree(&snapshot, &snapshot, &mut archive).unwrap();
+        archive.finish().unwrap();
+        let prepared = prepare_restore(&zip).unwrap();
+        assert_eq!(prepared.contents(), BackupContents::default());
+        let restored = prepared
+            .restore(
+                &current,
+                BackupContents {
+                    settings: true,
+                    data: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(restored.db_path, current.db_path);
+        assert_eq!(restored.max_items, backup.max_items);
+        assert_eq!(history(&restored), "current history");
+    }
 
     #[test]
     fn full_backup_restores_wal_settings_and_cached_paths_without_overwriting() {
