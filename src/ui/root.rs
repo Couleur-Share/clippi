@@ -454,14 +454,13 @@ impl RootView {
                             this.toast_timer_expiry =
                                 Some(std::time::Instant::now() + Duration::from_secs(5));
                         }
-                        UpdatePhase::UpToDate => {
+                        UpdatePhase::UpToDate
                             if this.state.read(cx).toast_message.as_deref()
-                                == Some(I18nKey::VersionChecking.text())
-                            {
-                                this.state.update(cx, |s, _| s.clear_toast());
-                                this.toast_actions = None;
-                                this.toast_timer_expiry = None;
-                            }
+                                == Some(I18nKey::VersionChecking.text()) =>
+                        {
+                            this.state.update(cx, |s, _| s.clear_toast());
+                            this.toast_actions = None;
+                            this.toast_timer_expiry = None;
                         }
                         _ => {}
                     }
