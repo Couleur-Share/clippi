@@ -3,7 +3,16 @@
 use crate::core::i18n_keys::I18nKey;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
+#[cfg(target_os = "windows")]
+#[path = "hotkey_input.rs"]
+mod special_input;
+#[cfg(target_os = "macos")]
+use global_hotkey::GlobalHotKeyManager as HotkeyManager;
+#[cfg(target_os = "windows")]
+pub(crate) use special_input::observe_claimed_key;
+#[cfg(target_os = "windows")]
+use special_input::HotkeyManager;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::time::{Duration, Instant};
 
@@ -45,6 +54,10 @@ pub enum QuickAction {
 pub enum HotkeyRecordingPress {
     Hotkey(String),
     AwaitingSingle(String),
+    /// First clean modifier tap: feedback only, never confirmable as a single key.
+    AwaitingDouble(String),
+    /// An intervening input invalidated a pending single/double recording.
+    PendingCleared,
     Cancel,
     /// The pressed key is a protected single key and was rejected.
     /// The recorder keeps listening for an allowed key.
@@ -90,6 +103,8 @@ pub trait HotkeyListener {
     }
     /// Begin recording for a custom hotkey (does not unregister existing hotkeys).
     fn start_custom_recording(&mut self);
+    /// App paste shortcuts must remain keyboard combinations that SendInput can emit.
+    fn restrict_recording_to_keyboard(&mut self) {}
     /// Temporarily unregister the hotkey (for blacklist).
     /// Does nothing if already unregistered.
     fn unregister(&mut self);
@@ -122,6 +137,14 @@ fn hotkey_register_error_message() -> String {
 
 pub(crate) fn key_name_to_code(name: &str) -> Option<Code> {
     match name {
+        // Reserved internal codes: these bindings are routed to the mouse hook,
+        // never to RegisterHotKey as actual LaunchApp keyboard keys.
+        #[cfg(target_os = "windows")]
+        "mouse3" => Some(Code::LaunchMail),
+        #[cfg(target_os = "windows")]
+        "mouse4" => Some(Code::LaunchApp1),
+        #[cfg(target_os = "windows")]
+        "mouse5" => Some(Code::LaunchApp2),
         "a" => Some(Code::KeyA),
         "b" => Some(Code::KeyB),
         "c" => Some(Code::KeyC),
@@ -198,6 +221,12 @@ pub(crate) fn key_name_to_code(name: &str) -> Option<Code> {
 /// Shared keycode mapping: Code variant → display name (platform-agnostic).
 pub(crate) fn key_code_to_name(code: Code) -> &'static str {
     match code {
+        #[cfg(target_os = "windows")]
+        Code::LaunchMail => "Mouse3",
+        #[cfg(target_os = "windows")]
+        Code::LaunchApp1 => "Mouse4",
+        #[cfg(target_os = "windows")]
+        Code::LaunchApp2 => "Mouse5",
         Code::KeyA => "A",
         Code::KeyB => "B",
         Code::KeyC => "C",
@@ -268,7 +297,17 @@ pub(crate) fn key_code_to_name(code: Code) -> &'static str {
 }
 
 fn parse_hotkey(value: &str) -> Result<HotKey, String> {
+    #[cfg(target_os = "windows")]
+    let double = is_double_hotkey(value);
     let value = value.strip_prefix("Double:").unwrap_or(value);
+    #[cfg(target_os = "windows")]
+    if let Some(code) = modifier_code(value.trim()) {
+        return if double {
+            Ok(HotKey::new(None, code))
+        } else {
+            Err(I18nKey::HotkeyModifierDoubleOnly.text().to_string())
+        };
+    }
     let mut modifiers = Modifiers::empty();
     let mut key = None;
 
@@ -278,12 +317,52 @@ fn parse_hotkey(value: &str) -> Result<HotKey, String> {
             "alt" | "option" => modifiers |= Modifiers::ALT,
             "shift" => modifiers |= Modifiers::SHIFT,
             "cmd" | "command" | "win" | "super" | "meta" => modifiers |= Modifiers::SUPER,
-            name => key = key_name_to_code(name),
+            name => {
+                if key.is_some() {
+                    return Err(I18nKey::HotkeyErrNoKey.text().to_string());
+                }
+                key = key_name_to_code(name);
+                if key.is_none() {
+                    return Err(I18nKey::HotkeyErrNoKey.text().to_string());
+                }
+            }
         }
     }
 
     let key = key.ok_or(I18nKey::HotkeyErrNoKey.text())?;
     Ok(HotKey::new(Some(modifiers), key))
+}
+
+/// Modifier-only gestures use dedicated key codes, never RegisterHotKey.
+#[cfg(target_os = "windows")]
+fn modifier_code(name: &str) -> Option<Code> {
+    match name.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => Some(Code::ControlLeft),
+        "shift" => Some(Code::ShiftLeft),
+        "alt" | "option" => Some(Code::AltLeft),
+        "win" | "super" | "meta" | "cmd" | "command" => Some(Code::MetaLeft),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn modifier_name(code: Code) -> Option<&'static str> {
+    match code {
+        Code::ControlLeft => Some("Ctrl"),
+        Code::ShiftLeft => Some("Shift"),
+        Code::AltLeft => Some("Alt"),
+        Code::MetaLeft => Some("Win"),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_hook_hotkey(hotkey: HotKey) -> bool {
+    modifier_name(hotkey.key).is_some()
+        || matches!(
+            hotkey.key,
+            Code::LaunchMail | Code::LaunchApp1 | Code::LaunchApp2
+        )
 }
 
 fn is_double_hotkey(value: &str) -> bool {
@@ -297,10 +376,22 @@ fn double_hotkey(value: &str) -> String {
 /// User-facing hotkey label. Keep the `Double:` prefix as an internal,
 /// backwards-compatible storage detail only.
 pub(crate) fn hotkey_display(value: &str) -> String {
-    value.strip_prefix("Double:").map_or_else(
-        || value.to_string(),
-        |key| I18nKey::HotkeyDoubleDisplay.fmt(&[key]),
-    )
+    let key = value.strip_prefix("Double:").unwrap_or(value);
+    let label = key
+        .split('+')
+        .map(|part| match part.trim().to_ascii_lowercase().as_str() {
+            "mouse3" => "M3".to_string(),
+            "mouse4" => "M4".to_string(),
+            "mouse5" => "M5".to_string(),
+            _ => part.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    if is_double_hotkey(value) {
+        I18nKey::HotkeyDoubleDisplay.fmt(&[&label])
+    } else {
+        label
+    }
 }
 
 /// Convert a polled key-down level into a physical press edge. A second press
@@ -774,7 +865,7 @@ struct LatestHotkeyBinding {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 struct DesktopHotkeyListener {
-    manager: GlobalHotKeyManager,
+    manager: HotkeyManager,
     hotkey: HotKey,
     quick_hotkey: HotKey,
     is_recording: bool,
@@ -806,6 +897,8 @@ struct DesktopHotkeyListener {
     main_double_press: bool,
     quick_double_press: bool,
     pending_double_press: Option<(u32, Instant)>,
+    #[cfg(target_os = "windows")]
+    pending_mouse_double_press: Option<(u32, Instant)>,
     recording_single: Option<(String, Instant)>,
     confirm_recording_single: bool,
     recording_key_down: Option<Code>,
@@ -814,8 +907,8 @@ struct DesktopHotkeyListener {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 impl DesktopHotkeyListener {
     fn new(hotkey_str: &str, quick_hotkey_str: &str) -> Result<Self, String> {
-        let manager = GlobalHotKeyManager::new()
-            .map_err(|e| format!("Failed to create hotkey manager: {e}"))?;
+        let manager =
+            HotkeyManager::new().map_err(|e| format!("Failed to create hotkey manager: {e}"))?;
 
         // ── Main hotkey: try configured → fallback chain ──
         let mut actual_main = hotkey_str.to_string();
@@ -925,10 +1018,42 @@ impl DesktopHotkeyListener {
             main_double_press: is_double_hotkey(&actual_main),
             quick_double_press: is_double_hotkey(&actual_quick),
             pending_double_press: None,
+            #[cfg(target_os = "windows")]
+            pending_mouse_double_press: None,
             recording_single: None,
             confirm_recording_single: false,
             recording_key_down: None,
         })
+    }
+
+    fn reset_gestures(&mut self) {
+        self.pending_double_press = None;
+        #[cfg(target_os = "windows")]
+        {
+            self.pending_mouse_double_press = None;
+            self.manager.clear_pending_input();
+        }
+    }
+
+    fn match_binding(&self, id: u32) -> Option<(HotkeyEvent, bool)> {
+        if self.registered && id == self.hotkey.id() {
+            Some((HotkeyEvent::Main, self.main_double_press))
+        } else if self.quick_registered && id == self.quick_hotkey.id() {
+            Some((HotkeyEvent::Quick, self.quick_double_press))
+        } else if self.paste_plain_registered && id == self.paste_plain_hotkey.id() {
+            Some((HotkeyEvent::PastePlain, self.paste_plain_double_press))
+        } else if let Some(binding) = self
+            .item_hotkeys
+            .iter()
+            .find(|binding| binding.registered && binding.hotkey.id() == id)
+        {
+            Some((HotkeyEvent::CustomItem(binding.id), binding.double_press))
+        } else {
+            self.latest_hotkeys
+                .iter()
+                .find(|binding| binding.registered && binding.hotkey.id() == id)
+                .map(|binding| (HotkeyEvent::LatestItem(binding.slot), binding.double_press))
+        }
     }
 
     fn register_hotkey(&self, hotkey: HotKey) -> Result<(), String> {
@@ -956,8 +1081,7 @@ impl DesktopHotkeyListener {
             return true;
         }
         // Check against the paste-plain hotkey.
-        if !ignore_paste_plain && self.paste_plain_registered && self.paste_plain_hotkey.id() == id
-        {
+        if !ignore_paste_plain && self.paste_plain_enabled && self.paste_plain_hotkey.id() == id {
             return true;
         }
         // Check against item hotkeys.
@@ -1054,6 +1178,7 @@ impl HotkeyListener for DesktopHotkeyListener {
     }
 
     fn update_hotkey(&mut self, hotkey_str: &str) -> Result<(), String> {
+        self.reset_gestures();
         let new_hotkey = parse_hotkey(hotkey_str)?;
         if is_protected_single_hotkey(new_hotkey) {
             return Err(I18nKey::HotkeyProtectedSingleKey.text().to_string());
@@ -1084,6 +1209,7 @@ impl HotkeyListener for DesktopHotkeyListener {
     }
 
     fn update_quick_hotkey(&mut self, hotkey_str: &str) -> Result<(), String> {
+        self.reset_gestures();
         // Empty string means disable quick hotkey.
         if hotkey_str.is_empty() {
             if self.quick_registered {
@@ -1124,6 +1250,7 @@ impl HotkeyListener for DesktopHotkeyListener {
     }
 
     fn update_paste_plain_hotkey(&mut self, hotkey_str: &str) -> Result<(), String> {
+        self.reset_gestures();
         // Empty string disables: unregister immediately (spec §2.4 清空即停用).
         if hotkey_str.is_empty() {
             if self.paste_plain_registered {
@@ -1180,6 +1307,13 @@ impl HotkeyListener for DesktopHotkeyListener {
     }
 
     fn start_recording(&mut self) {
+        self.pending_double_press = None;
+        #[cfg(target_os = "windows")]
+        {
+            self.pending_mouse_double_press = None;
+        }
+        #[cfg(target_os = "windows")]
+        self.manager.set_recording(true);
         self.recording_single = None;
         self.confirm_recording_single = false;
         self.recording_key_down = None;
@@ -1187,6 +1321,8 @@ impl HotkeyListener for DesktopHotkeyListener {
     }
 
     fn finish_recording(&mut self) {
+        #[cfg(target_os = "windows")]
+        self.manager.set_recording(false);
         self.is_recording = false;
         self.recording_single = None;
         self.confirm_recording_single = false;
@@ -1202,7 +1338,17 @@ impl HotkeyListener for DesktopHotkeyListener {
         self.start_recording();
     }
 
+    fn restrict_recording_to_keyboard(&mut self) {
+        #[cfg(target_os = "windows")]
+        self.manager.set_record_special(false);
+    }
+
     fn unregister(&mut self) {
+        self.pending_double_press = None;
+        #[cfg(target_os = "windows")]
+        {
+            self.pending_mouse_double_press = None;
+        }
         if self.registered {
             let _ = self.manager.unregister(self.hotkey);
             self.registered = false;
@@ -1277,6 +1423,32 @@ impl HotkeyListener for DesktopHotkeyListener {
             while GlobalHotKeyEvent::receiver().try_recv().is_ok() {}
             return None;
         }
+        #[cfg(target_os = "windows")]
+        while let Some(event) = self.manager.pop_event() {
+            match event {
+                special_input::InputEvent::Interrupted => self.pending_mouse_double_press = None,
+                special_input::InputEvent::Press(hotkey, at) => {
+                    if let Some((action, double)) = self.match_binding(hotkey.id()) {
+                        if modifier_name(hotkey.key).is_some() || !double {
+                            return Some(action);
+                        }
+                        if self
+                            .pending_mouse_double_press
+                            .is_some_and(|(id, previous)| {
+                                id == hotkey.id()
+                                    && at.duration_since(previous) <= DOUBLE_PRESS_WINDOW
+                            })
+                        {
+                            self.pending_mouse_double_press = None;
+                            return Some(action);
+                        }
+                        self.pending_mouse_double_press = Some((hotkey.id(), at));
+                    }
+                }
+                special_input::InputEvent::Key(_, _, _)
+                | special_input::InputEvent::ModifierTap(_) => {}
+            }
+        }
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
             // Released and stale/unrecognised events must not stop draining the
             // shared queue; otherwise the following press waits for another poll.
@@ -1284,24 +1456,7 @@ impl HotkeyListener for DesktopHotkeyListener {
                 continue;
             }
             let id = event.id();
-            let matched = if id == self.hotkey.id() {
-                Some((HotkeyEvent::Main, self.main_double_press))
-            } else if self.quick_enabled && id == self.quick_hotkey.id() {
-                Some((HotkeyEvent::Quick, self.quick_double_press))
-            } else if self.paste_plain_enabled && id == self.paste_plain_hotkey.id() {
-                Some((HotkeyEvent::PastePlain, self.paste_plain_double_press))
-            } else if let Some(binding) = self
-                .item_hotkeys
-                .iter()
-                .find(|binding| binding.registered && binding.hotkey.id() == id)
-            {
-                Some((HotkeyEvent::CustomItem(binding.id), binding.double_press))
-            } else {
-                self.latest_hotkeys
-                    .iter()
-                    .find(|binding| binding.registered && binding.hotkey.id() == id)
-                    .map(|binding| (HotkeyEvent::LatestItem(binding.slot), binding.double_press))
-            };
+            let matched = self.match_binding(id);
             if let Some((matched_event, double_press)) = matched {
                 if !double_press {
                     return Some(matched_event);
@@ -1340,17 +1495,71 @@ impl HotkeyListener for DesktopHotkeyListener {
             }
         }
         let now = Instant::now();
+        #[cfg(target_os = "macos")]
         if let Some(candidate) = take_expired_recording_single(&mut self.recording_single, now) {
             return Some(HotkeyRecordingPress::Hotkey(candidate));
         }
+        #[cfg(target_os = "windows")]
+        let (code, modifiers, now) = if !self.manager.has_monitor() {
+            if let Some(candidate) = take_expired_recording_single(&mut self.recording_single, now)
+            {
+                return Some(HotkeyRecordingPress::Hotkey(candidate));
+            }
+            let code =
+                recording_key_edge(&mut self.recording_key_down, platform_input::pressed_key())?;
+            (code, platform_input::pressed_modifiers(), now)
+        } else {
+            loop {
+                let Some(event) = self.manager.pop_event() else {
+                    return take_expired_recording_single(&mut self.recording_single, now)
+                        .map(HotkeyRecordingPress::Hotkey);
+                };
+                match event {
+                    special_input::InputEvent::ModifierTap(code) => {
+                        self.recording_single = None;
+                        return modifier_name(code)
+                            .map(|name| HotkeyRecordingPress::AwaitingDouble(name.to_string()));
+                    }
+                    special_input::InputEvent::Press(hotkey, at) => {
+                        if let Some(name) = modifier_name(hotkey.key) {
+                            self.recording_single = None;
+                            return Some(HotkeyRecordingPress::Hotkey(double_hotkey(name)));
+                        }
+                        break (hotkey.key, hotkey.mods, at);
+                    }
+                    special_input::InputEvent::Key(code, modifiers, at) => {
+                        break (code, modifiers, at)
+                    }
+                    special_input::InputEvent::Interrupted => {
+                        if self
+                            .recording_single
+                            .as_ref()
+                            .is_some_and(|(name, _)| name.contains("Mouse"))
+                        {
+                            self.recording_single = None;
+                            return Some(HotkeyRecordingPress::PendingCleared);
+                        }
+                    }
+                }
+            }
+        };
+        #[cfg(target_os = "macos")]
         let code = recording_key_edge(&mut self.recording_key_down, platform_input::pressed_key())?;
+        #[cfg(target_os = "macos")]
         let modifiers = platform_input::pressed_modifiers();
         let press = format_recorded_hotkey(modifiers, code)?;
         match press {
-            HotkeyRecordingPress::Hotkey(candidate) if modifiers.is_empty() => {
+            HotkeyRecordingPress::Hotkey(candidate)
+                if modifiers.is_empty() || candidate.contains("Mouse") =>
+            {
                 if self.recording_single.as_ref().is_some_and(|(pending, at)| {
                     pending == &candidate
-                        && now.duration_since(*at) <= RECORDING_SINGLE_CONFIRM_DELAY
+                        && now.duration_since(*at)
+                            <= if candidate.contains("Mouse") {
+                                DOUBLE_PRESS_WINDOW
+                            } else {
+                                RECORDING_SINGLE_CONFIRM_DELAY
+                            }
                 }) {
                     self.recording_single = None;
                     Some(HotkeyRecordingPress::Hotkey(double_hotkey(&candidate)))
@@ -1376,6 +1585,7 @@ impl HotkeyListener for DesktopHotkeyListener {
     }
 
     fn register_item_hotkey(&mut self, id: i64, hotkey_str: &str) -> Result<(), String> {
+        self.reset_gestures();
         let hk = parse_hotkey(hotkey_str)?;
         if is_protected_single_hotkey(hk) {
             return Err(I18nKey::HotkeyProtectedSingleKey.text().to_string());
@@ -1431,6 +1641,7 @@ impl HotkeyListener for DesktopHotkeyListener {
     }
 
     fn register_latest_hotkey(&mut self, slot: usize, hotkey_str: &str) -> Result<(), String> {
+        self.reset_gestures();
         let hk = parse_hotkey(hotkey_str)?;
         if is_protected_single_hotkey(hk) {
             return Err(I18nKey::HotkeyProtectedSingleKey.text().to_string());
@@ -1556,44 +1767,42 @@ impl HotkeyListener for DesktopHotkeyListener {
 
 #[cfg(target_os = "windows")]
 mod platform_input {
-    use super::{Code, Modifiers};
-    use ::windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
-        VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
-    };
-
-    fn any_key_down(keys: &[u16]) -> bool {
-        // SAFETY: `GetAsyncKeyState` only reads the current state for the
-        // provided well-known Windows virtual-key codes.
-        keys.iter()
-            .any(|key| unsafe { GetAsyncKeyState(i32::from(*key)) < 0 })
-    }
+    use super::Code;
 
     pub fn super_key_name() -> &'static str {
         "Win"
     }
 
-    pub fn pressed_modifiers() -> Modifiers {
-        let mut modifiers = Modifiers::empty();
-        if any_key_down(&[VK_CONTROL.0, VK_LCONTROL.0, VK_RCONTROL.0]) {
-            modifiers |= Modifiers::CONTROL;
-        }
-        // Some keyboard layouts and Windows menu-mode transitions do not
-        // reliably expose left Alt through the aggregate VK_MENU state. Read
-        // both side-specific keys as well.
-        if any_key_down(&[VK_MENU.0, VK_LMENU.0, VK_RMENU.0]) {
-            modifiers |= Modifiers::ALT;
-        }
-        if any_key_down(&[VK_SHIFT.0, VK_LSHIFT.0, VK_RSHIFT.0]) {
-            modifiers |= Modifiers::SHIFT;
-        }
-        if any_key_down(&[VK_LWIN.0, VK_RWIN.0]) {
-            modifiers |= Modifiers::SUPER;
-        }
-        modifiers
+    pub fn pressed_key() -> Option<Code> {
+        (0..256).find_map(|vk| {
+            let code = code_for_vk(vk)?;
+            (unsafe {
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk as i32)
+            } < 0)
+                .then_some(code)
+        })
     }
 
-    pub fn pressed_key() -> Option<Code> {
+    pub fn pressed_modifiers() -> super::Modifiers {
+        [
+            (0x10, super::Modifiers::SHIFT),
+            (0x11, super::Modifiers::CONTROL),
+            (0x12, super::Modifiers::ALT),
+            (0x5b, super::Modifiers::SUPER),
+            (0x5c, super::Modifiers::SUPER),
+        ]
+        .into_iter()
+        .fold(super::Modifiers::empty(), |mods, (vk, modifier)| {
+            if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk) } < 0
+            {
+                mods | modifier
+            } else {
+                mods
+            }
+        })
+    }
+
+    pub fn code_for_vk(vk: u32) -> Option<Code> {
         let key_map: &[(i32, Code)] = &[
             (0x41, Code::KeyA),
             (0x42, Code::KeyB),
@@ -1663,16 +1872,9 @@ mod platform_input {
             (0x2D, Code::Insert),       // VK_INSERT
         ];
 
-        // SAFETY: `GetAsyncKeyState` is a non-blocking poll callable from
-        // any thread. All virtual key codes in `key_map` are well-known
-        // Windows VK_ constants.
-        key_map.iter().find_map(|(virtual_key, code)| unsafe {
-            if GetAsyncKeyState(*virtual_key) < 0 {
-                Some(*code)
-            } else {
-                None
-            }
-        })
+        key_map
+            .iter()
+            .find_map(|(key, code)| (*key == vk as i32).then_some(*code))
     }
 }
 
@@ -1852,5 +2054,454 @@ pub fn create_hotkey_listener(
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         panic!("Unsupported platform")
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod special_binding_tests {
+    use super::*;
+    use special_input::InputEvent;
+
+    // No native shortcut registrations or input hooks: exercises listener
+    // routing/lifecycle against an in-memory monitor.
+    fn listener() -> DesktopHotkeyListener {
+        let hotkey = parse_hotkey("Double:Ctrl").unwrap();
+        DesktopHotkeyListener {
+            manager: HotkeyManager::for_test(vec![hotkey]),
+            hotkey,
+            quick_hotkey: HotKey::new(None, Code::F24),
+            is_recording: false,
+            registered: true,
+            quick_enabled: false,
+            quick_registered: false,
+            quick_action_hotkeys: quick_action_hotkeys(),
+            quick_actions_registered: false,
+            paste_plain_hotkey: HotKey::new(None, Code::F24),
+            paste_plain_enabled: false,
+            paste_plain_registered: false,
+            paste_plain_double_press: false,
+            actual_main_hotkey: "Double:Ctrl".to_string(),
+            actual_quick_hotkey: String::new(),
+            main_fallback_used: false,
+            quick_fallback_used: false,
+            item_hotkeys: Vec::new(),
+            latest_hotkeys: Vec::new(),
+            main_double_press: true,
+            quick_double_press: false,
+            pending_double_press: None,
+            pending_mouse_double_press: None,
+            recording_single: None,
+            confirm_recording_single: false,
+            recording_key_down: None,
+        }
+    }
+
+    #[test]
+    fn parser_accepts_side_keys_and_only_double_modifiers() {
+        for name in [
+            "Ctrl", "Control", "Shift", "Alt", "Option", "Win", "Super", "Meta", "Cmd", "Command",
+        ] {
+            assert!(parse_hotkey(name).is_err(), "single {name}");
+            assert!(modifier_name(parse_hotkey(&format!("Double:{name}")).unwrap().key).is_some());
+        }
+        assert_eq!(
+            parse_hotkey("Double:Control").unwrap(),
+            parse_hotkey("Double:Ctrl").unwrap()
+        );
+        assert_eq!(
+            parse_hotkey("Double:Mouse4").unwrap(),
+            parse_hotkey("Mouse4").unwrap()
+        );
+        assert_eq!(
+            parse_hotkey("Ctrl+Mouse5").unwrap().mods,
+            Modifiers::CONTROL
+        );
+        for name in [
+            "Double:Ctrl+Shift",
+            "Mouse1",
+            "Mouse2",
+            "Ctrl+bogus+V",
+            "V+C",
+        ] {
+            assert!(parse_hotkey(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn system_modifier_aliases_conflict_and_record_canonical_names() {
+        let mut listener = listener();
+        for (name, alias) in [("Alt", "Option"), ("Win", "Command")] {
+            listener.update_hotkey(&format!("Double:{name}")).unwrap();
+            assert!(listener
+                .update_quick_hotkey(&format!("Double:{alias}"))
+                .is_err());
+            assert!(listener
+                .register_item_hotkey(42, &format!("Double:{alias}"))
+                .is_err());
+            assert!(listener
+                .register_latest_hotkey(2, &format!("Double:{alias}"))
+                .is_err());
+            assert!(listener
+                .update_paste_plain_hotkey(&format!("Double:{alias}"))
+                .is_err());
+            listener.start_custom_recording();
+            listener.manager.push_test_event(InputEvent::Press(
+                parse_hotkey(&format!("Double:{alias}")).unwrap(),
+                Instant::now(),
+            ));
+            assert_eq!(
+                listener.poll_recording_pressed(),
+                Some(HotkeyRecordingPress::Hotkey(format!("Double:{name}")))
+            );
+            assert!(!listener.confirm_pending_single());
+            listener.finish_recording();
+            listener.register();
+        }
+    }
+
+    #[test]
+    fn modifier_gesture_is_dispatched_once_after_the_monitor_completed_both_taps() {
+        let mut listener = listener();
+        let at = Instant::now();
+        listener
+            .manager
+            .push_test_event(InputEvent::Press(listener.hotkey, at));
+        assert_eq!(listener.poll_event(), Some(HotkeyEvent::Main));
+        assert_eq!(listener.poll_event(), None);
+    }
+
+    #[test]
+    fn side_keys_use_physical_event_times_for_double_clicks() {
+        let mut listener = listener();
+        listener.update_hotkey("Double:Mouse4").unwrap();
+        let at = Instant::now() - Duration::from_secs(3);
+        listener
+            .manager
+            .push_test_event(InputEvent::Press(listener.hotkey, at));
+        listener.manager.push_test_event(InputEvent::Press(
+            listener.hotkey,
+            at + Duration::from_millis(200),
+        ));
+        assert_eq!(listener.poll_event(), Some(HotkeyEvent::Main));
+        assert_eq!(listener.poll_event(), None);
+        listener.manager.push_test_event(InputEvent::Press(
+            listener.hotkey,
+            at + Duration::from_millis(1000),
+        ));
+        listener.manager.push_test_event(InputEvent::Press(
+            listener.hotkey,
+            at + Duration::from_millis(1800),
+        ));
+        assert_eq!(listener.poll_event(), None);
+    }
+
+    #[test]
+    fn input_interruptions_cancel_side_double_click_but_preserve_keyboard_double_candidate() {
+        let mut listener = listener();
+        listener.update_hotkey("Double:Mouse5").unwrap();
+        let at = Instant::now();
+        listener
+            .manager
+            .push_test_event(InputEvent::Press(listener.hotkey, at));
+        assert_eq!(listener.poll_event(), None);
+        listener.pending_double_press = Some((parse_hotkey("Double:F1").unwrap().id(), at));
+        listener.manager.push_test_event(InputEvent::Interrupted);
+        listener.manager.push_test_event(InputEvent::Press(
+            listener.hotkey,
+            at + Duration::from_millis(100),
+        ));
+        assert_eq!(listener.poll_event(), None);
+        assert!(listener.pending_double_press.is_some());
+    }
+
+    #[test]
+    fn single_side_key_routes_to_each_supported_action() {
+        let mut listener = listener();
+        listener.update_hotkey("Mouse4").unwrap();
+        listener.update_quick_hotkey("Shift+Mouse4").unwrap();
+        listener.update_paste_plain_hotkey("Ctrl+Mouse4").unwrap();
+        listener.register_item_hotkey(42, "Alt+Mouse4").unwrap();
+        listener.register_latest_hotkey(2, "Mouse5").unwrap();
+        for (name, action) in [
+            ("Mouse4", HotkeyEvent::Main),
+            ("Shift+Mouse4", HotkeyEvent::Quick),
+            ("Ctrl+Mouse4", HotkeyEvent::PastePlain),
+            ("Alt+Mouse4", HotkeyEvent::CustomItem(42)),
+            ("Mouse5", HotkeyEvent::LatestItem(2)),
+        ] {
+            listener.manager.push_test_event(InputEvent::Press(
+                parse_hotkey(name).unwrap(),
+                Instant::now(),
+            ));
+            assert_eq!(listener.poll_event(), Some(action));
+        }
+    }
+
+    #[test]
+    fn middle_button_supports_recording_single_double_and_modifier_combinations() {
+        for name in [
+            "Mouse3",
+            "Ctrl+Mouse3",
+            "Shift+Mouse3",
+            "Alt+Mouse3",
+            "Win+Mouse3",
+        ] {
+            let hotkey = parse_hotkey(name).unwrap();
+            assert_eq!(hotkey.key, Code::LaunchMail);
+            let mut listener = listener();
+            listener.start_custom_recording();
+            let at = Instant::now();
+            listener
+                .manager
+                .push_test_event(InputEvent::Press(hotkey, at));
+            assert_eq!(
+                listener.poll_recording_pressed(),
+                Some(HotkeyRecordingPress::AwaitingSingle(name.to_string()))
+            );
+            listener
+                .manager
+                .push_test_event(InputEvent::Press(hotkey, at + Duration::from_millis(100)));
+            assert_eq!(
+                listener.poll_recording_pressed(),
+                Some(HotkeyRecordingPress::Hotkey(format!("Double:{name}")))
+            );
+            listener.finish_recording();
+            listener.register();
+            listener.update_hotkey(name).unwrap();
+            listener
+                .manager
+                .push_test_event(InputEvent::Press(hotkey, at));
+            assert_eq!(listener.poll_event(), Some(HotkeyEvent::Main));
+            assert!(listener
+                .update_quick_hotkey(&format!("Double:{name}"))
+                .is_err());
+            listener.update_hotkey(&format!("Double:{name}")).unwrap();
+            listener
+                .manager
+                .push_test_event(InputEvent::Press(hotkey, at));
+            assert_eq!(listener.poll_event(), None);
+            listener
+                .manager
+                .push_test_event(InputEvent::Press(hotkey, at + Duration::from_millis(100)));
+            assert_eq!(listener.poll_event(), Some(HotkeyEvent::Main));
+        }
+    }
+
+    #[test]
+    fn aliases_and_single_double_variants_conflict_across_all_binding_types() {
+        let mut listener = listener();
+        assert!(listener.update_quick_hotkey("Double:Control").is_err());
+        assert!(listener.register_item_hotkey(42, "Double:Control").is_err());
+        assert!(listener
+            .register_latest_hotkey(2, "Double:Control")
+            .is_err());
+        assert!(listener
+            .update_paste_plain_hotkey("Double:Control")
+            .is_err());
+        assert_eq!(listener.actual_main_hotkey(), "Double:Ctrl");
+        listener.update_quick_hotkey("Mouse4").unwrap();
+        assert!(listener.update_hotkey("Double:Mouse4").is_err());
+        listener.update_paste_plain_hotkey("Mouse5").unwrap();
+        listener.unregister();
+        // Disabled registrations still reserve their configured identities.
+        assert!(listener.register_item_hotkey(42, "Double:Mouse5").is_err());
+        listener.register();
+        assert!(
+            listener.registered && listener.quick_registered && listener.paste_plain_registered
+        );
+    }
+
+    #[test]
+    fn changing_single_double_mode_and_blacklisting_drop_old_candidates() {
+        let mut listener = listener();
+        listener.update_hotkey("Double:Mouse4").unwrap();
+        listener
+            .manager
+            .push_test_event(InputEvent::Press(listener.hotkey, Instant::now()));
+        assert_eq!(listener.poll_event(), None);
+        listener.update_hotkey("Mouse4").unwrap();
+        listener.update_hotkey("Double:Mouse4").unwrap();
+        listener
+            .manager
+            .push_test_event(InputEvent::Press(listener.hotkey, Instant::now()));
+        assert_eq!(listener.poll_event(), None);
+        listener.unregister();
+        listener
+            .manager
+            .push_test_event(InputEvent::Press(listener.hotkey, Instant::now()));
+        assert_eq!(listener.poll_event(), None);
+        listener.register();
+        listener
+            .manager
+            .push_test_event(InputEvent::Press(listener.hotkey, Instant::now()));
+        assert_eq!(listener.poll_event(), None);
+    }
+
+    #[test]
+    fn first_modifier_tap_returns_feedback_without_a_single_candidate() {
+        for (name, code) in [
+            ("Ctrl", Code::ControlLeft),
+            ("Shift", Code::ShiftLeft),
+            ("Alt", Code::AltLeft),
+            ("Win", Code::MetaLeft),
+        ] {
+            let mut listener = listener();
+            listener.start_custom_recording();
+            listener
+                .manager
+                .push_test_event(InputEvent::ModifierTap(code));
+            assert_eq!(
+                listener.poll_recording_pressed(),
+                Some(HotkeyRecordingPress::AwaitingDouble(name.to_string()))
+            );
+            assert!(!listener.confirm_pending_single());
+            assert!(listener.is_recording());
+            listener.manager.push_test_event(InputEvent::Press(
+                parse_hotkey(&format!("Double:{name}")).unwrap(),
+                Instant::now(),
+            ));
+            assert_eq!(
+                listener.poll_recording_pressed(),
+                Some(HotkeyRecordingPress::Hotkey(format!("Double:{name}")))
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_and_double_labels_are_compact_without_changing_storage() {
+        assert_eq!(hotkey_display("Mouse3"), "M3");
+        assert_eq!(hotkey_display("Mouse4"), "M4");
+        assert_eq!(hotkey_display("Mouse5"), "M5");
+        assert_eq!(hotkey_display("Double:Mouse5"), "M5 ×2");
+        assert_eq!(hotkey_display("Double:Ctrl+Mouse3"), "Ctrl+M3 ×2");
+        assert_eq!(hotkey_display("Double:Ctrl"), "Ctrl ×2");
+        assert_eq!(hotkey_display("Alt+V"), "Alt+V");
+        assert!(parse_hotkey("Double:Mouse5").is_ok());
+    }
+
+    #[test]
+    fn recording_modifier_has_no_single_confirmation_and_does_not_fire_actions() {
+        let mut listener = listener();
+        listener.start_custom_recording();
+        listener.manager.push_test_event(InputEvent::Press(
+            parse_hotkey("Double:Shift").unwrap(),
+            Instant::now(),
+        ));
+        assert_eq!(listener.poll_event(), None);
+        assert_eq!(
+            listener.poll_recording_pressed(),
+            Some(HotkeyRecordingPress::Hotkey("Double:Shift".to_string()))
+        );
+        assert!(!listener.confirm_pending_single());
+        listener.finish_recording();
+        listener.register();
+        assert!(listener.registered);
+    }
+
+    #[test]
+    fn recording_side_double_uses_capture_time_even_if_main_thread_is_delayed() {
+        let mut listener = listener();
+        listener.start_custom_recording();
+        let at = Instant::now() - Duration::from_secs(3);
+        listener
+            .manager
+            .push_test_event(InputEvent::Press(parse_hotkey("Ctrl+Mouse4").unwrap(), at));
+        listener.manager.push_test_event(InputEvent::Press(
+            parse_hotkey("Ctrl+Mouse4").unwrap(),
+            at + Duration::from_millis(100),
+        ));
+        assert_eq!(
+            listener.poll_recording_pressed(),
+            Some(HotkeyRecordingPress::AwaitingSingle(
+                "Ctrl+Mouse4".to_string()
+            ))
+        );
+        assert_eq!(
+            listener.poll_recording_pressed(),
+            Some(HotkeyRecordingPress::Hotkey(
+                "Double:Ctrl+Mouse4".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn left_click_confirmation_survives_an_intervening_recording_poll() {
+        for name in [
+            "Mouse3",
+            "Mouse4",
+            "Mouse5",
+            "Ctrl+Mouse3",
+            "Ctrl+Mouse4",
+            "Alt+Mouse5",
+            "F1",
+        ] {
+            let mut listener = listener();
+            listener.start_custom_recording();
+            let hotkey = parse_hotkey(name).unwrap();
+            listener
+                .manager
+                .push_test_event(InputEvent::Press(hotkey, Instant::now()));
+            assert_eq!(
+                listener.poll_recording_pressed(),
+                Some(HotkeyRecordingPress::AwaitingSingle(name.to_string()))
+            );
+            // The hook sees the physical click first. A 16ms recording poll may
+            // run before GPUI dispatches the button's mouse-down callback.
+            listener.manager.primary_click_for_test(true);
+            listener.manager.primary_click_for_test(false);
+            assert_eq!(listener.poll_recording_pressed(), None);
+            assert!(listener.confirm_pending_single());
+            // A queued second press cannot override an explicit confirmation.
+            listener
+                .manager
+                .push_test_event(InputEvent::Press(hotkey, Instant::now()));
+            assert_eq!(
+                listener.poll_recording_pressed(),
+                Some(HotkeyRecordingPress::Hotkey(name.to_string()))
+            );
+            listener.finish_recording();
+            listener.register();
+            if name.contains("Mouse") {
+                listener.update_quick_hotkey(name).unwrap();
+                assert!(!listener.quick_double_press);
+                listener
+                    .manager
+                    .push_test_event(InputEvent::Press(hotkey, Instant::now()));
+                assert_eq!(listener.poll_event(), Some(HotkeyEvent::Quick));
+            }
+        }
+    }
+
+    #[test]
+    fn recording_side_single_can_be_confirmed_or_cancelled_by_other_input() {
+        let mut listener = listener();
+        listener.start_custom_recording();
+        listener.manager.push_test_event(InputEvent::Press(
+            parse_hotkey("Mouse4").unwrap(),
+            Instant::now(),
+        ));
+        assert!(matches!(
+            listener.poll_recording_pressed(),
+            Some(HotkeyRecordingPress::AwaitingSingle(_))
+        ));
+        listener.manager.push_test_event(InputEvent::Interrupted);
+        assert_eq!(
+            listener.poll_recording_pressed(),
+            Some(HotkeyRecordingPress::PendingCleared)
+        );
+        assert!(!listener.confirm_pending_single());
+        listener.manager.push_test_event(InputEvent::Press(
+            parse_hotkey("Mouse5").unwrap(),
+            Instant::now(),
+        ));
+        assert!(matches!(
+            listener.poll_recording_pressed(),
+            Some(HotkeyRecordingPress::AwaitingSingle(_))
+        ));
+        assert!(listener.confirm_pending_single());
+        assert_eq!(
+            listener.poll_recording_pressed(),
+            Some(HotkeyRecordingPress::Hotkey("Mouse5".to_string()))
+        );
     }
 }

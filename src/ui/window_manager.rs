@@ -1697,6 +1697,22 @@ impl WindowManager {
             // --- avoiding any AppState synchronization gap. ---
             if let Some(recording_press) = hk.poll_recording_pressed() {
                 let new_hotkey = match recording_press {
+                    HotkeyRecordingPress::AwaitingDouble(_) => {
+                        self.state.update(cx, |state, cx| {
+                            state.pending_single_hotkey = None;
+                            state.show_toast(I18nKey::HotkeyModifierAwaiting.text());
+                            cx.notify();
+                        });
+                        cx.notify();
+                        return;
+                    }
+                    HotkeyRecordingPress::PendingCleared => {
+                        self.state.update(cx, |state, _cx| {
+                            state.pending_single_hotkey = None;
+                        });
+                        cx.notify();
+                        return;
+                    }
                     HotkeyRecordingPress::AwaitingSingle(candidate) => {
                         self.state.update(cx, |state, _cx| {
                             state.pending_single_hotkey = Some(candidate);
@@ -1735,6 +1751,11 @@ impl WindowManager {
                     HotkeyRecordingPress::Hotkey(new_hotkey) => {
                         self.state.update(cx, |state, _cx| {
                             state.pending_single_hotkey = None;
+                            if state.toast_message.as_deref()
+                                == Some(I18nKey::HotkeyModifierAwaiting.text())
+                            {
+                                state.toast_message = None;
+                            }
                         });
                         new_hotkey
                     }
@@ -1987,7 +2008,19 @@ impl WindowManager {
 
         // --- Auto-hide logic for main window ---
         // --- Guard conditions: any true → skip auto-hide ---
-        if !self.auto_hide || self.pinned || !self.visible || self.is_suppressed() || is_self_fg {
+        // Win/Alt recording may briefly activate a system menu. Keep settings
+        // visible until recording completes or the user explicitly cancels it.
+        let recording = self
+            .hotkey
+            .as_ref()
+            .is_some_and(|hotkey| hotkey.is_recording());
+        if !self.auto_hide
+            || self.pinned
+            || !self.visible
+            || self.is_suppressed()
+            || is_self_fg
+            || recording
+        {
             return;
         }
 
@@ -5114,6 +5147,10 @@ impl WindowManager {
             state.settings.paste_plain_hotkey.clear();
             state.settings.save();
         });
+        if self.state.read(cx).recording_paste_plain_hotkey {
+            self.cancel_active_hotkey_recording(cx);
+        }
+        cx.notify();
     }
 
     /// Reload the paste-plain hotkey registration from settings (recording
@@ -5134,6 +5171,9 @@ impl WindowManager {
     pub fn start_paste_shortcut_recording(&mut self, app_name: String, cx: &mut Context<Self>) {
         self.recording_paste_shortcut_app = Some(app_name);
         self.start_hotkey_recording(cx); // reuse recording infra
+        if let Some(hotkey) = &mut self.hotkey {
+            hotkey.restrict_recording_to_keyboard();
+        }
     }
 
     /// Cancel a paste shortcut recording — re-register the global hotkey
@@ -5247,6 +5287,9 @@ impl WindowManager {
             .as_mut()
             .is_some_and(|hotkey| hotkey.confirm_pending_single());
         if confirmed {
+            // Commit through the normal registration/persistence path inside
+            // this click callback, before another recording poll can run.
+            self.poll_recording(cx);
             cx.notify();
         }
         confirmed

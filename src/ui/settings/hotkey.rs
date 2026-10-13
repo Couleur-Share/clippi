@@ -130,13 +130,21 @@ impl SettingsPanel {
         let desc_text = if waiting {
             I18nKey::HotkeySingleAwaiting.text()
         } else if recording {
-            I18nKey::HotkeyPressToRecord.text()
+            if cfg!(target_os = "windows") {
+                I18nKey::HotkeyPressToRecordExtended.text()
+            } else {
+                I18nKey::HotkeyPressToRecord.text()
+            }
         } else {
             // AC-12: optional idle-state description replaces the legacy
             // "点击开始录制" only when `idle_desc` is provided.
             options
                 .idle_desc
-                .unwrap_or(I18nKey::HotkeyRecordingIdle)
+                .unwrap_or(if cfg!(target_os = "windows") {
+                    I18nKey::HotkeyRecordingIdleExtended
+                } else {
+                    I18nKey::HotkeyRecordingIdle
+                })
                 .text()
         };
         // Clear affordance (a text "重置" button for the paste-plain card) is
@@ -158,11 +166,10 @@ impl SettingsPanel {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    // Constrain the column only for cards with a description
-                    // override, so long AC-12 descriptions ellipsize instead
-                    // of overflowing. Existing callers (no override) keep the
-                    // legacy content-sized column.
-                    .when(options.idle_desc.is_some(), |d| d.flex_1().min_w(px(0.)))
+                    // Leave room for the recording controls and extended hints.
+                    .flex_1()
+                    .min_w(px(0.))
+                    .mr(px(8.))
                     .child(
                         div()
                             .text_size(fs(12.))
@@ -174,12 +181,10 @@ impl SettingsPanel {
                         div()
                             .text_size(fs(10.))
                             .text_color(desc_color)
-                            .when(options.idle_desc.is_some(), |d| {
-                                d.max_w_full()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                            })
+                            .max_w_full()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
                             .child(desc_text),
                     ),
             )
@@ -244,8 +249,8 @@ impl SettingsPanel {
                                     .text_size(fs(11.))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(recording_btn_text)
-                                    .child(if let Some(candidate) = pending_single {
-                                        I18nKey::HotkeyConfirmSingle.fmt(&[&candidate])
+                                    .child(if pending_single.is_some() {
+                                        I18nKey::HotkeyConfirmSingle.text().to_string()
                                     } else {
                                         hotkey_display.to_string()
                                     }),

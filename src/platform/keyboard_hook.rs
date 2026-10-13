@@ -437,6 +437,7 @@ mod windows_impl {
     /// underneath receives neither half of a key that was typed into the search
     /// box.
     fn claim_ignored(vk: u32) -> LRESULT {
+        crate::platform::hotkey::observe_claimed_key(vk, false);
         if let Ok(mut keys) = claimed().lock() {
             if !keys.contains(&vk) {
                 keys.push(vk);
@@ -447,6 +448,7 @@ mod windows_impl {
 
     /// Claim a key press: remember it so its release is swallowed as well.
     fn claim(vk: u32, key: QuickKey) -> LRESULT {
+        crate::platform::hotkey::observe_claimed_key(vk, false);
         if let Ok(mut keys) = claimed().lock() {
             if !keys.contains(&vk) {
                 keys.push(vk);
@@ -477,6 +479,7 @@ mod windows_impl {
             // down (Enter), so the application underneath must not receive that
             // press's release as a stray keystroke either.
             return if key_up && unclaim(info.vkCode) {
+                crate::platform::hotkey::observe_claimed_key(info.vkCode, true);
                 1
             } else {
                 pass_through()
@@ -484,6 +487,11 @@ mod windows_impl {
         }
 
         let vk = info.vkCode as u16;
+        // Bare modifiers must reach the tap observer and the OS/IME unchanged,
+        // including while quick search owns ordinary typing.
+        if matches!(vk, 0x10..=0x12 | 0xa0..=0xa5 | 0x5b..=0x5c) {
+            return pass_through();
+        }
         // Whether the popup is taking the typing — either its search box is in
         // its text-entry state, or it has taken the input method over — and what
         // its input method is doing. The input method is read from the popup
@@ -498,6 +506,7 @@ mod windows_impl {
 
         if key_up {
             return if unclaim(info.vkCode) {
+                crate::platform::hotkey::observe_claimed_key(info.vkCode, true);
                 1
             } else {
                 pass_through()
