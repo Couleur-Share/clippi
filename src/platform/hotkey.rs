@@ -78,6 +78,10 @@ pub trait HotkeyListener {
     fn start_recording(&mut self);
     fn finish_recording(&mut self);
     fn is_recording(&self) -> bool;
+    /// Briefly keep the recorder visible while Alt/Win opens a system menu.
+    fn recording_system_menu_gesture(&self) -> bool {
+        false
+    }
     fn poll_event(&mut self) -> Option<HotkeyEvent>;
     fn poll_recording_pressed(&mut self) -> Option<HotkeyRecordingPress>;
     fn confirm_pending_single(&mut self) -> bool;
@@ -1331,6 +1335,17 @@ impl HotkeyListener for DesktopHotkeyListener {
 
     fn is_recording(&self) -> bool {
         self.is_recording
+    }
+
+    fn recording_system_menu_gesture(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.is_recording && self.manager.recording_system_menu_gesture()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
     }
 
     fn start_custom_recording(&mut self) {

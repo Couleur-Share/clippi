@@ -1692,6 +1692,10 @@ impl WindowManager {
     /// hotkey is registered (via `update_hotkey`); on error the old hotkey is
     /// re-registered.
     fn poll_recording(&mut self, cx: &mut Context<Self>) {
+        if !self.visible && !self.quick_visible {
+            self.cancel_active_hotkey_recording(cx);
+            return;
+        }
         if let Some(ref mut hk) = self.hotkey {
             // poll_recording_pressed() returns None when not recording —            // it checks the hotkey's internal is_recording flag directly,
             // --- avoiding any AppState synchronization gap. ---
@@ -2008,18 +2012,19 @@ impl WindowManager {
 
         // --- Auto-hide logic for main window ---
         // --- Guard conditions: any true → skip auto-hide ---
-        // Win/Alt recording may briefly activate a system menu. Keep settings
-        // visible until recording completes or the user explicitly cancels it.
-        let recording = self
+        // Only a pending Alt/Win gesture temporarily suspends focus-loss hiding.
+        // Leaving the recorder for another application follows normal auto-hide
+        // behavior, which cancels recording as part of hide().
+        let recording_system_menu = self
             .hotkey
             .as_ref()
-            .is_some_and(|hotkey| hotkey.is_recording());
+            .is_some_and(|hotkey| hotkey.recording_system_menu_gesture());
         if !self.auto_hide
             || self.pinned
             || !self.visible
             || self.is_suppressed()
             || is_self_fg
-            || recording
+            || recording_system_menu
         {
             return;
         }
@@ -3548,6 +3553,7 @@ impl WindowManager {
 
     /// Hide the window to background — does NOT exit the process.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.cancel_active_hotkey_recording(cx);
         #[cfg(target_os = "windows")]
         {
             self._main_show_task = None;
@@ -3771,6 +3777,9 @@ impl WindowManager {
     }
 
     fn hide_quick_window(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            self.cancel_active_hotkey_recording(cx);
+        }
         // Release the keyboard hook together with the popup: keystrokes belong
         // to the application the user is typing in again.
         keyboard_hook::set_enabled(false);
@@ -5261,6 +5270,7 @@ impl WindowManager {
             return false;
         }
 
+        self._recording_poll_task = None;
         self.recording_paste_shortcut_app = None;
         self.recording_item_hotkey_id = None;
         self.recording_item_hotkey_format = None;
@@ -5270,6 +5280,9 @@ impl WindowManager {
             state.recording_quick_hotkey = false;
             state.recording_paste_plain_hotkey = false;
             state.pending_single_hotkey = None;
+            if state.toast_message.as_deref() == Some(I18nKey::HotkeyModifierAwaiting.text()) {
+                state.toast_message = None;
+            }
         });
         if let Some(ref mut hk) = self.hotkey {
             hk.finish_recording();

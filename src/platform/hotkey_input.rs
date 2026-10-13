@@ -196,6 +196,18 @@ impl InputState {
             }
             return;
         };
+        let hotkey = HotKey::new(None, code);
+        let enabled = if self.recording {
+            self.record_special
+        } else {
+            self.bindings.contains(&hotkey)
+        };
+        if !enabled {
+            // Track held modifiers for mouse combinations and interference,
+            // but never create double-tap candidates for unbound modifiers.
+            self.interrupt();
+            return;
+        }
         if pressed {
             self.enqueue(InputEvent::Interrupted);
             let held_keys = self.down.iter().filter(|down| **down).count();
@@ -679,6 +691,19 @@ impl HotkeyManager {
         state.other_mouse(if right { WM_RBUTTONUP } else { WM_LBUTTONUP });
     }
 
+    pub fn recording_system_menu_gesture(&self) -> bool {
+        let Some(monitor) = &self.monitor else {
+            return false;
+        };
+        let state = monitor.state.lock().expect("hotkey input lock poisoned");
+        state.recording
+            && state.record_special
+            && [state.tap, state.previous_tap]
+                .into_iter()
+                .flatten()
+                .any(|tap| opens_system_menu(tap.vk) && tap.at.elapsed() <= DOUBLE_PRESS_WINDOW)
+    }
+
     pub fn has_monitor(&self) -> bool {
         self.monitor.is_some()
     }
@@ -750,6 +775,44 @@ mod tests {
             );
             assert!(!state.down.iter().any(|down| *down));
         }
+    }
+
+    #[test]
+    fn unbound_modifiers_never_create_double_tap_candidates() {
+        let at = Instant::now();
+        for vk in [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0x5b, 0x5c] {
+            let mut state = InputState::default();
+            tap(&mut state, vk, at, 0);
+            assert!(state.tap.is_none() && state.previous_tap.is_none());
+            tap(&mut state, vk, at, 100);
+            assert!(presses(&state).is_empty());
+            state
+                .bindings
+                .push(HotKey::new(None, modifier(vk).unwrap().0));
+            tap(&mut state, vk, at, 200);
+            assert!(state.previous_tap.is_some());
+            tap(&mut state, vk, at, 300);
+            assert_eq!(presses(&state).len(), 1);
+        }
+    }
+
+    #[test]
+    fn unbound_modifier_cancels_bound_taps_but_remains_available_for_mouse_combinations() {
+        let at = Instant::now();
+        let mut state = InputState::default();
+        state.bindings.push(HotKey::new(None, Code::ShiftLeft));
+        tap(&mut state, 0xa0, at, 0);
+        tap(&mut state, 0xa2, at, 100);
+        assert!(state.tap.is_none() && state.previous_tap.is_none());
+        tap(&mut state, 0xa0, at, 200);
+        assert!(presses(&state).is_empty());
+        state.reset();
+        let mouse = HotKey::new(Some(Modifiers::CONTROL), Code::LaunchApp1);
+        state.bindings.push(mouse);
+        edge(&mut state, 0xa2, true, at, 300);
+        assert!(state.tap.is_none());
+        assert!(state.mouse_button(0, true, false, at + Duration::from_millis(310), 1));
+        assert_eq!(presses(&state), vec![mouse]);
     }
 
     #[test]
