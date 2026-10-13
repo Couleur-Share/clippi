@@ -1,5 +1,6 @@
 //! --- Platform adaptation layer ---
 
+pub mod accent;
 pub mod blacklist;
 pub mod clipboard;
 pub mod focus;

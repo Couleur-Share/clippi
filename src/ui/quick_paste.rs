@@ -969,7 +969,7 @@ impl QuickPasteView {
     }
 
     fn theme(&self, appearance: WindowAppearance, cx: &Context<Self>) -> ClippiTheme {
-        ClippiTheme::from_setting(&self.state.read(cx).settings.theme, Some(appearance))
+        ClippiTheme::from_settings(&self.state.read(cx).settings, Some(appearance))
     }
 }
 

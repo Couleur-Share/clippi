@@ -321,6 +321,7 @@ unsafe extern "system" fn clippi_subclass_proc(
 
 /// Events emitted by WindowManager for consumption by RootView.
 pub enum WindowManagerEvent {
+    SystemAccentChanged,
     /// Clipboard data changed; RootView should refresh its list.
     ClipboardChanged,
     /// Transfer activity changed without changing list contents.
@@ -938,6 +939,12 @@ impl WindowManager {
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
+        if crate::ui::theme::refresh_system_accent() {
+            cx.emit(WindowManagerEvent::SystemAccentChanged);
+            if let Some(view) = &self.quick_view {
+                view.update(cx, |_, cx| cx.notify());
+            }
+        }
         let operation_active = self.data_operation.is_active();
         if operation_active != self.data_operation_observed {
             self.data_operation_observed = operation_active;

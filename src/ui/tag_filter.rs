@@ -201,7 +201,7 @@ impl Render for TagFilterPanel {
             .collect();
         let tag_match_all = app_state.filters.is_tag_match_all();
         let has_tag_filter = !app_state.filters.tag_ids.is_empty();
-        let theme = ClippiTheme::from_setting(&app_state.settings.theme, Some(window.appearance()));
+        let theme = ClippiTheme::from_settings(&app_state.settings, Some(window.appearance()));
         let _ = app_state;
 
         let is_dark = theme.bg == rgb(0x191a1b);
@@ -213,10 +213,9 @@ impl Render for TagFilterPanel {
         let input_bg = theme.panel_input_bg;
         let sep_line = theme.panel_sep_line;
         let btn_hover = theme.btn_hover;
-        let accent_hover_bg = if is_dark {
-            rgba(0x7ecba335)
-        } else {
-            rgba(0x6ab89035)
+        let accent_hover_bg = gpui::Rgba {
+            a: 0x35 as f32 / 255.0,
+            ..accent
         };
         let panel_border = if is_dark {
             rgba(0xffffff14)
@@ -625,11 +624,7 @@ pub fn render_edit_panel(
     } else {
         rgba(0x00000012)
     };
-    let accent_hover = if is_dark {
-        rgba(0x7ecba3cc)
-    } else {
-        rgba(0x6ab890cc)
-    };
+    let accent_hover = gpui::Rgba { a: 0.8, ..accent };
     let current_color = parse_hex_to_rgba(color);
     let presets: Vec<Rgba> = tag_preset_colors()
         .iter()

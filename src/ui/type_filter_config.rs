@@ -156,7 +156,7 @@ impl Render for TypeFilterConfigPanel {
             let app_state = self.state.read(cx);
             (
                 app_state.settings.type_filter_config.clone(),
-                ClippiTheme::from_setting(&app_state.settings.theme, Some(window.appearance())),
+                ClippiTheme::from_settings(&app_state.settings, Some(window.appearance())),
             )
         };
 

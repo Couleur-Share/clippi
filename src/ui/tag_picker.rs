@@ -122,10 +122,9 @@ impl RenderOnce for TagPickerPanel {
         let text_3 = theme.text_3;
         let accent = theme.accent;
         let btn_hover = theme.btn_hover;
-        let accent_hover_bg = if is_dark {
-            rgba(0x7ecba335)
-        } else {
-            rgba(0x6ab89035)
+        let accent_hover_bg = gpui::Rgba {
+            a: 0x35 as f32 / 255.0,
+            ..accent
         };
         let sep_line = theme.panel_sep_line;
         let panel_border = if is_dark {

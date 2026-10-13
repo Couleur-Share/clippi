@@ -108,16 +108,70 @@ struct OverlayTransitionState {
 }
 
 impl RootView {
+    fn refresh_theme(&mut self, cx: &mut Context<Self>) {
+        // --- Use cached window_appearance from creation time so ---
+        // --- "system" theme resolves correctly even though we ---
+        // --- only have &mut App here (not WindowContext). ---
+        self.theme =
+            ClippiTheme::from_settings(&self.state.read(cx).settings, Some(self.window_appearance));
+        let theme = self.theme.clone();
+
+        // --- Sync gpui_component theme so that Input, Scrollbar ---
+        // --- and other gpui_component widgets follow our theme. ---
+        let is_dark = theme.bg == rgb(0x191a1b);
+        gpui_component::Theme::change(
+            if is_dark {
+                gpui_component::ThemeMode::Dark
+            } else {
+                gpui_component::ThemeMode::Light
+            },
+            None,
+            cx,
+        );
+        // --- Must restore transparent background after Theme::change ---
+        // --- resets it — otherwise the window loses transparency. ---
+        gpui_component::Theme::global_mut(cx).background = Hsla::transparent_black();
+        // --- Theme::change also resets font_size/font_family to ---
+        // --- defaults; re-push the user's font scale and family. ---
+        super::font::apply_to_global_theme(cx);
+        theme.sync_component_accent(cx);
+
+        self.titlebar.update(cx, |titlebar, cx| {
+            titlebar.set_theme(theme.clone(), cx);
+        });
+        self.search_box.update(cx, |search_box, cx| {
+            search_box.set_theme(theme.clone(), cx);
+        });
+        self.filter_bar.update(cx, |filter_bar, cx| {
+            filter_bar.set_theme(theme.clone(), cx);
+        });
+        self.list_view.update(cx, |list_view, cx| {
+            list_view.set_theme(theme.clone(), cx);
+        });
+        self.settings_panel.update(cx, |panel, cx| {
+            panel.reload_theme(theme.clone(), cx);
+        });
+        self.edit_panel.update(cx, |panel, cx| {
+            panel.set_theme(theme.clone(), cx);
+        });
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_theme(&theme, cx);
+        });
+        cx.notify();
+    }
+
     pub fn new(
         window: &mut Window,
         state: Entity<AppState>,
         window_manager: Entity<WindowManager>,
         cx: &mut Context<Self>,
     ) -> Self {
+        super::theme::refresh_system_accent();
         let app_state = state.read(cx);
         let items = app_state.visible_items();
         let window_appearance = window.appearance();
-        let theme = ClippiTheme::from_setting(&app_state.settings.theme, Some(window_appearance));
+        let theme = ClippiTheme::from_settings(&app_state.settings, Some(window_appearance));
+        theme.sync_component_accent(cx);
         let list_view = cx.new(|cx| {
             ClipboardListView::new(
                 items,
@@ -166,6 +220,11 @@ impl RootView {
         let _wm_subscription = cx.subscribe(
             &window_manager,
             move |this, _wm, event: &WindowManagerEvent, cx| match event {
+                WindowManagerEvent::SystemAccentChanged => {
+                    if this.state.read(cx).settings.theme_color == "system" {
+                        this.refresh_theme(cx);
+                    }
+                }
                 WindowManagerEvent::ClipboardChanged => {
                     let items = this.state.read(cx).visible_items();
                     let scroll_to_top = this.state.read(cx).settings.auto_scroll_to_top;
@@ -665,56 +724,8 @@ impl RootView {
                             cx.notify();
                         }
                     }
-                    SettingsEvent::ThemeChanged(theme_str) => {
-                        // --- Use cached window_appearance from creation time so ---
-                        // --- "system" theme resolves correctly even though we ---
-                        // --- only have &mut App here (not WindowContext). ---
-                        this.theme =
-                            ClippiTheme::from_setting(theme_str, Some(this.window_appearance));
-                        let theme = this.theme.clone();
-
-                        // --- Sync gpui_component theme so that Input, Scrollbar ---
-                        // --- and other gpui_component widgets follow our theme. ---
-                        let is_dark = theme.bg == rgb(0x191a1b);
-                        gpui_component::Theme::change(
-                            if is_dark {
-                                gpui_component::ThemeMode::Dark
-                            } else {
-                                gpui_component::ThemeMode::Light
-                            },
-                            None,
-                            cx,
-                        );
-                        // --- Must restore transparent background after Theme::change ---
-                        // --- resets it — otherwise the window loses transparency. ---
-                        gpui_component::Theme::global_mut(cx).background =
-                            Hsla::transparent_black();
-                        // --- Theme::change also resets font_size/font_family to ---
-                        // --- defaults; re-push the user's font scale and family. ---
-                        super::font::apply_to_global_theme(cx);
-
-                        this.titlebar.update(cx, |titlebar, cx| {
-                            titlebar.set_theme(theme.clone(), cx);
-                        });
-                        this.search_box.update(cx, |search_box, cx| {
-                            search_box.set_theme(theme.clone(), cx);
-                        });
-                        this.filter_bar.update(cx, |filter_bar, cx| {
-                            filter_bar.set_theme(theme.clone(), cx);
-                        });
-                        this.list_view.update(cx, |list_view, cx| {
-                            list_view.set_theme(theme.clone(), cx);
-                        });
-                        this.settings_panel.update(cx, |panel, cx| {
-                            panel.reload_theme(theme.clone(), cx);
-                        });
-                        this.edit_panel.update(cx, |panel, cx| {
-                            panel.set_theme(theme.clone(), cx);
-                        });
-                        this.sidebar.update(cx, |sidebar, cx| {
-                            sidebar.set_theme(&theme, cx);
-                        });
-                        cx.notify();
+                    SettingsEvent::ThemeChanged => {
+                        this.refresh_theme(cx);
                     }
                     SettingsEvent::ClipboardSettingsChanged {
                         reload_items,
@@ -818,45 +829,11 @@ impl RootView {
             // from an explicit theme to "system" after an OS change.
             this.window_appearance = win.appearance();
 
-            // Only rebuild theme when the user has selected "system".
-            if this.state.read(cx).settings.theme != "system" {
-                return;
+            if this.state.read(cx).settings.theme == "system"
+                || this.state.read(cx).settings.theme_color == "system"
+            {
+                this.refresh_theme(cx);
             }
-
-            this.theme = ClippiTheme::from_setting("system", Some(this.window_appearance));
-            let theme = this.theme.clone();
-
-            // Sync gpui_component theme so that Input, Scrollbar and other
-            // gpui_component widgets follow our theme.
-            let is_dark = theme.bg == rgb(0x191a1b);
-            gpui_component::Theme::change(
-                if is_dark {
-                    gpui_component::ThemeMode::Dark
-                } else {
-                    gpui_component::ThemeMode::Light
-                },
-                None,
-                cx,
-            );
-            gpui_component::Theme::global_mut(cx).background = Hsla::transparent_black();
-            // --- Theme::change reset font_size/font_family; restore them. ---
-            super::font::apply_to_global_theme(cx);
-            // Propagate to child views (mirrors ThemeChanged handler).
-            this.titlebar
-                .update(cx, |tb, cx| tb.set_theme(theme.clone(), cx));
-            this.search_box
-                .update(cx, |sb, cx| sb.set_theme(theme.clone(), cx));
-            this.filter_bar
-                .update(cx, |fb, cx| fb.set_theme(theme.clone(), cx));
-            this.list_view
-                .update(cx, |lv, cx| lv.set_theme(theme.clone(), cx));
-            this.settings_panel
-                .update(cx, |sp, cx| sp.reload_theme(theme.clone(), cx));
-            this.edit_panel
-                .update(cx, |ep, cx| ep.set_theme(theme.clone(), cx));
-            this.sidebar.update(cx, |sb, cx| sb.set_theme(&theme, cx));
-
-            cx.notify();
         });
 
         Self {

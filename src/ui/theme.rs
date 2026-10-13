@@ -68,7 +68,7 @@ impl ClippiTheme {
             transfer_pin_color: rgb(0x3B82F6),
 
             tag_bg: rgb(0x2c2e2f),
-            tag_text: rgb(0xddf5e4),
+            tag_text: rgb(0xe4e9e6),
 
             panel_surface: rgb(0x2c2d2e),
             panel_input_bg: rgb(0x1e1f20),
@@ -99,7 +99,7 @@ impl ClippiTheme {
             transfer_pin_color: rgb(0x3B82F6),
 
             tag_bg: rgb(0xe6e8f0),
-            tag_text: rgb(0x6c857c),
+            tag_text: rgb(0x767e7a),
 
             panel_surface: rgb(0xffffff),
             panel_input_bg: rgb(0xf5f6fc),
@@ -107,6 +107,39 @@ impl ClippiTheme {
 
             toast_bg: rgba(0xfffffff0),
         }
+    }
+
+    pub fn from_settings(
+        settings: &crate::core::settings::AppSettings,
+        appearance: Option<WindowAppearance>,
+    ) -> Self {
+        let mut theme = Self::from_setting(&settings.theme, appearance);
+        if settings.theme_color == "system" {
+            if let Some(color) = *SYSTEM_ACCENT.lock().expect("system accent cache poisoned") {
+                theme.accent = color;
+                let weight = if theme.bg == rgb(0x191a1b) {
+                    0.16
+                } else {
+                    0.12
+                };
+                theme.accent_soft = Rgba {
+                    r: theme.bg.r * (1.0 - weight) + color.r * weight,
+                    g: theme.bg.g * (1.0 - weight) + color.g * weight,
+                    b: theme.bg.b * (1.0 - weight) + color.b * weight,
+                    a: 1.0,
+                };
+            }
+        }
+        theme
+    }
+
+    pub fn sync_component_accent(&self, cx: &mut gpui::App) {
+        let global = gpui_component::Theme::global_mut(cx);
+        global.primary = self.accent.into();
+        global.primary_hover = self.accent.into();
+        global.primary_active = self.accent.into();
+        global.selection = self.accent_overlay().into();
+        global.ring = self.accent.into();
     }
 
     pub fn from_setting(theme: &str, appearance: Option<WindowAppearance>) -> Self {
@@ -120,12 +153,11 @@ impl ClippiTheme {
         }
     }
 
-    /// Accent color as a 22% opacity overlay (used for active filter button backgrounds).
+    /// Accent color as a 13% opacity overlay (used for active filter button backgrounds).
     pub fn accent_overlay(&self) -> Rgba {
-        if self.bg == rgb(0x191a1b) {
-            rgba(0x7ecba322)
-        } else {
-            rgba(0x6ab89022)
+        Rgba {
+            a: 0x22 as f32 / 255.0,
+            ..self.accent
         }
     }
 
@@ -133,9 +165,15 @@ impl ClippiTheme {
     /// overlay so short highlighted terms remain visible in dense previews.
     pub fn accent_highlight(&self) -> Rgba {
         if self.bg == rgb(0x191a1b) {
-            rgba(0x7ecba366)
+            Rgba {
+                a: 0.4,
+                ..self.accent
+            }
         } else {
-            rgba(0x6ab8904d)
+            Rgba {
+                a: 0x4d as f32 / 255.0,
+                ..self.accent
+            }
         }
     }
 
@@ -144,6 +182,60 @@ impl ClippiTheme {
             rgb(0xffffff)
         } else {
             rgb(0x000000)
+        }
+    }
+}
+
+static SYSTEM_ACCENT: std::sync::Mutex<Option<Rgba>> = std::sync::Mutex::new(None);
+
+/// Called on the GPUI main thread at startup and by the existing poll loop.
+pub fn refresh_system_accent() -> bool {
+    static LAST_READ: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST_READ.lock().expect("system accent timer poisoned");
+    if last.is_some_and(|time| time.elapsed() < std::time::Duration::from_secs(1)) {
+        return false;
+    }
+    *last = Some(std::time::Instant::now());
+    let color = crate::platform::accent::read_system_accent();
+    let mut cached = SYSTEM_ACCENT.lock().expect("system accent cache poisoned");
+    let changed = *cached != color;
+    *cached = color;
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_color_old_settings_default_and_round_trip() {
+        let settings = crate::core::settings::AppSettings::default();
+        let mut value = serde_json::to_value(settings).unwrap();
+        value.as_object_mut().unwrap().remove("theme_color");
+        let mut loaded: crate::core::settings::AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.theme_color, "default");
+        loaded.theme_color = "system".into();
+        let saved = toml::to_string(&loaded).unwrap();
+        let restored: crate::core::settings::AppSettings = toml::from_str(&saved).unwrap();
+        assert_eq!(restored.theme_color, "system");
+    }
+
+    #[test]
+    fn overlays_follow_accent_and_preserve_default_colors() {
+        assert_eq!(ClippiTheme::dark().accent_overlay(), rgba(0x7ecba322));
+        assert_eq!(ClippiTheme::light().accent_highlight(), rgba(0x6ab8904d));
+        for mut theme in [ClippiTheme::light(), ClippiTheme::dark()] {
+            theme.accent = rgb(0x0067c0);
+            let overlay = theme.accent_overlay();
+            let highlight = theme.accent_highlight();
+            assert_eq!(
+                (overlay.r, overlay.g, overlay.b),
+                (theme.accent.r, theme.accent.g, theme.accent.b)
+            );
+            assert_eq!(
+                (highlight.r, highlight.g, highlight.b),
+                (theme.accent.r, theme.accent.g, theme.accent.b)
+            );
         }
     }
 }

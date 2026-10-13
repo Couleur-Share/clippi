@@ -52,7 +52,7 @@ pub enum SettingsEvent {
     /// switching to the version tab (index 5).
     TabChanged(usize),
     /// Theme setting changed — RootView should rebuild its ClippiTheme.
-    ThemeChanged(String),
+    ThemeChanged,
     ClipboardSettingsChanged {
         reload_items: bool,
         scroll_to_top: bool,

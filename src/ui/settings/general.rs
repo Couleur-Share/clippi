@@ -35,6 +35,7 @@ impl SettingsPanel {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let hide_taskbar_icon = app.settings.hide_taskbar_icon;
         let theme_str = app.settings.theme.clone();
+        let theme_color = app.settings.theme_color.clone();
         let position_mode = app.settings.window_position_mode.clone();
         let lang = app.settings.language.clone();
         let font_size_level = app.settings.font_size_level.clone();
@@ -397,7 +398,36 @@ impl SettingsPanel {
                             s.settings.save();
                         });
                         this.update(_cx, |_panel, cx| {
-                            cx.emit(SettingsEvent::ThemeChanged(theme_str));
+                            cx.emit(SettingsEvent::ThemeChanged);
+                            cx.notify();
+                        });
+                    },
+                )
+            }
+            .into_any_element(),
+            {
+                let state = state.clone();
+                let this = this.clone();
+                self.setting_row_with_options(
+                    I18nKey::SettingThemeColor.text(),
+                    I18nKey::DescThemeColor.text(),
+                    &[
+                        ("default", I18nKey::ThemeColorDefault.text()),
+                        ("system", I18nKey::ThemeColorSystem.text()),
+                    ],
+                    if theme_color == "system" {
+                        "system"
+                    } else {
+                        "default"
+                    },
+                    move |key, _window, cx| {
+                        state.update(cx, |s, cx| {
+                            s.settings.theme_color = key.to_string();
+                            s.settings.save();
+                            cx.notify();
+                        });
+                        this.update(cx, |_, cx| {
+                            cx.emit(SettingsEvent::ThemeChanged);
                             cx.notify();
                         });
                     },

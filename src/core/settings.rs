@@ -86,6 +86,8 @@ pub struct LatestHotkeyEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: String,
+    #[serde(default = "default_theme_color")]
+    pub theme_color: String,
     pub hotkey: String,
     #[serde(default)]
     pub replace_system_win_v: bool,
@@ -326,6 +328,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             theme: "system".to_string(),
+            theme_color: default_theme_color(),
             hotkey: "Alt+V".to_string(),
             replace_system_win_v: false,
             quick_hotkey: default_quick_hotkey(),
@@ -2267,4 +2270,8 @@ mod privacy_tests {
         let loaded: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
         assert!(loaded.privacy_protection_types.is_empty());
     }
+}
+
+fn default_theme_color() -> String {
+    "default".to_string()
 }
