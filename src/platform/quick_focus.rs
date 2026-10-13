@@ -134,10 +134,11 @@ mod windows_impl {
     };
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, IsWindow, GUITHREADINFO,
-        WM_CHAR, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
-        WM_NCDESTROY,
+        GetForegroundWindow, GetWindowThreadProcessId, IsWindow, WM_CHAR, WM_IME_CHAR,
+        WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_NCDESTROY,
     };
+
+    use crate::platform::focus::thread_input_windows;
 
     /// Subclass cookie; only has to be unique within our own window.
     const SUBCLASS_ID: usize = 0x434C_5050;
@@ -576,23 +577,6 @@ mod windows_impl {
         // queue".
         let thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
         thread_input_windows(thread)
-    }
-
-    /// Focus and active window of one thread's input queue.
-    fn thread_input_windows(thread_id: u32) -> (HWND, HWND) {
-        if thread_id == 0 {
-            return (std::ptr::null_mut(), std::ptr::null_mut());
-        }
-        // SAFETY: `GetGUIThreadInfo` is a read-only query; `GUITHREADINFO` is
-        // zero-initialised with `cbSize` set as the API requires.
-        unsafe {
-            let mut info: GUITHREADINFO = std::mem::zeroed();
-            info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
-            if GetGUIThreadInfo(thread_id, &mut info) == 0 {
-                return (std::ptr::null_mut(), std::ptr::null_mut());
-            }
-            (info.hwndFocus, info.hwndActive)
-        }
     }
 
     fn describe(hwnd: Option<HWND>) -> String {

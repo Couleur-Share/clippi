@@ -7,8 +7,6 @@ use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::HWND;
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-#[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -20,10 +18,9 @@ use windows_sys::Win32::UI::Accessibility::{
 use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PeekMessageW,
-    PostThreadMessageW, TranslateMessage, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GA_ROOT,
-    MSG, OBJID_CLIENT, OBJID_WINDOW, PM_REMOVE, WINEVENT_OUTOFCONTEXT, WM_QUIT,
+    GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GA_ROOT,
+    WINEVENT_OUTOFCONTEXT,
 };
 
 #[cfg(target_os = "windows")]
@@ -85,10 +82,6 @@ pub struct FocusWatcher {
     hook: HWINEVENTHOOK,
     #[cfg(target_os = "windows")]
     object_hook: HWINEVENTHOOK,
-    #[cfg(target_os = "windows")]
-    thread: Option<std::thread::JoinHandle<()>>,
-    #[cfg(target_os = "windows")]
-    thread_id: u32,
     #[cfg(target_os = "macos")]
     running: Arc<AtomicBool>,
     #[cfg(target_os = "macos")]
@@ -98,17 +91,10 @@ pub struct FocusWatcher {
 impl FocusWatcher {
     #[cfg(target_os = "windows")]
     pub fn stop(&mut self) {
-        // SAFETY: `UnhookWinEvent` removes a hook previously registered by
-        // `SetWinEventHook`. `PostThreadMessageW` posts a WM_QUIT to the
-        // message-pump thread identified by `self.thread_id`; the thread
-        // was created in `start_focus_watcher` and is guaranteed alive
-        // until `join()` returns.
+        // Hooks are registered on the GPUI thread, whose existing message
+        // loop delivers out-of-context callbacks. Remove them on that thread.
         unsafe { UnhookWinEvent(self.hook) };
         unsafe { UnhookWinEvent(self.object_hook) };
-        unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
     }
 
     #[cfg(target_os = "macos")]
@@ -188,41 +174,7 @@ pub fn start_focus_watcher() -> Result<FocusWatcher, String> {
         return Err("SetWinEventHook (focus) failed".to_string());
     }
 
-    // Channel to retrieve the actual thread ID from inside the message pump thread
-    let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(0);
-
-    let thread = std::thread::spawn(move || {
-        // SAFETY: `GetCurrentThreadId` returns a constant thread ID; always safe.
-        let tid = unsafe { GetCurrentThreadId() };
-        let _ = tx.send(tid); // blocks until receiver reads — ensures tid is available
-                              // SAFETY: `zeroed()` on a POD struct produces a valid zero-valued MSG.
-        let mut msg: MSG = unsafe { std::mem::zeroed() };
-        loop {
-            // SAFETY: `PeekMessageW` with a stack-allocated MSG and null HWND
-            // retrieves any message for this thread; the output pointer is valid.
-            let ret = unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) };
-            if ret == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                continue;
-            }
-            if msg.message == WM_QUIT {
-                break;
-            }
-            // SAFETY: `TranslateMessage` and `DispatchMessageW` are standard
-            // message-pump calls on a well-formed MSG obtained from `PeekMessageW`.
-            unsafe { TranslateMessage(&msg) };
-            unsafe { DispatchMessageW(&msg) };
-        }
-    });
-
-    let thread_id = rx.recv().unwrap_or(0);
-
-    Ok(FocusWatcher {
-        hook,
-        object_hook,
-        thread: Some(thread),
-        thread_id,
-    })
+    Ok(FocusWatcher { hook, object_hook })
 }
 
 #[cfg(target_os = "macos")]
@@ -336,6 +288,28 @@ fn root_window(hwnd: HWND) -> HWND {
     unsafe { GetAncestor(hwnd, GA_ROOT) }
 }
 
+/// Shell tray UI is transient navigation, never a clipboard destination.
+#[cfg(any(target_os = "windows", test))]
+fn is_tray_window_class(class: &str) -> bool {
+    matches!(
+        class,
+        "TopLevelWindowForOverflowXamlIsland"
+            | "NotifyIconOverflowWindow"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn is_tray_window(hwnd: HWND) -> bool {
+    [hwnd, root_window(hwnd)].into_iter().any(|window| {
+        let mut class = [0u16; 128];
+        // SAFETY: read-only class query into a correctly sized stack buffer.
+        let len = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
+        len > 0 && is_tray_window_class(&String::from_utf16_lossy(&class[..len as usize]))
+    })
+}
+
 /// Whether `hwnd` may legitimately receive a simulated paste.
 ///
 /// Rejects Clippi's own windows plus destroyed, hidden, and minimised windows.
@@ -353,7 +327,7 @@ pub fn is_valid_paste_target(hwnd: HWND) -> bool {
             return false;
         }
     }
-    !is_clippi_window(hwnd) && !is_own_process_window(hwnd)
+    !is_clippi_window(hwnd) && !is_own_process_window(hwnd) && !is_tray_window(hwnd)
 }
 
 /// Whether `hwnd` could be restored as a paste target.
@@ -372,7 +346,7 @@ pub fn is_restorable_paste_target(hwnd: HWND) -> bool {
             return false;
         }
     }
-    !is_clippi_window(hwnd) && !is_own_process_window(hwnd)
+    !is_clippi_window(hwnd) && !is_own_process_window(hwnd) && !is_tray_window(hwnd)
 }
 
 /// Read a window's title.
@@ -428,7 +402,7 @@ pub fn describe_window(hwnd: HWND) -> String {
 /// to, which is how launcher palettes (Listary, Quicker, …) hold the caret
 /// while the window behind them stays in front.
 #[cfg(target_os = "windows")]
-fn thread_input_windows(thread_id: u32) -> (HWND, HWND) {
+pub(crate) fn thread_input_windows(thread_id: u32) -> (HWND, HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetGUIThreadInfo, GUITHREADINFO};
 
     if thread_id == 0 {
@@ -446,15 +420,56 @@ fn thread_input_windows(thread_id: u32) -> (HWND, HWND) {
     }
 }
 
-/// Thread that owns the foreground window, or `0` when there is none.
+/// One best-effort observation of the foreground window and its input queue.
 #[cfg(target_os = "windows")]
-fn foreground_thread_id() -> u32 {
-    let foreground = unsafe { GetForegroundWindow() };
-    if foreground.is_null() {
-        return 0;
+struct InputContext {
+    foreground: HWND,
+    focus: Option<HWND>,
+}
+
+/// Focused/borrowed controls can be children of hidden launcher roots, whereas
+/// a foreground fallback must be visible. Keep these acceptance rules distinct.
+#[cfg(any(target_os = "windows", test))]
+fn select_input_owner<T: Copy>(
+    focus: Option<T>,
+    borrowed: Option<T>,
+    foreground: Option<T>,
+    accepts_focus: impl Fn(T) -> bool,
+    accepts_foreground: impl Fn(T) -> bool,
+) -> Option<T> {
+    focus
+        .filter(|&window| accepts_focus(window))
+        .or_else(|| borrowed.filter(|&window| accepts_focus(window)))
+        .or_else(|| foreground.filter(|&window| accepts_foreground(window)))
+}
+
+#[cfg(target_os = "windows")]
+impl InputContext {
+    fn capture() -> Self {
+        // Capture foreground once so its input queue and fallback HWND refer
+        // to the same observation, rather than two different activations.
+        let foreground = unsafe { GetForegroundWindow() };
+        let thread = if foreground.is_null() {
+            0
+        } else {
+            unsafe { GetWindowThreadProcessId(foreground, std::ptr::null_mut()) }
+        };
+        let (focus, active) = thread_input_windows(thread);
+        let focus = [focus, active, foreground]
+            .into_iter()
+            .find(|window| !window.is_null());
+        Self { foreground, focus }
     }
-    // SAFETY: `GetWindowThreadProcessId` is a read-only query.
-    unsafe { GetWindowThreadProcessId(foreground, std::ptr::null_mut()) }
+
+    fn live_owner(&self) -> Option<HWND> {
+        select_input_owner(
+            self.focus,
+            crate::platform::quick_focus::borrowed_focus_owner().map(|hwnd| hwnd as HWND),
+            (!self.foreground.is_null()).then_some(self.foreground),
+            is_foreign_input_window,
+            is_valid_paste_target,
+        )
+    }
 }
 
 /// Focused child window reported by the thread that owns `hwnd`.
@@ -480,15 +495,7 @@ pub fn focused_child_of(hwnd: HWND) -> Option<HWND> {
 /// active window and then to the foreground window when no focus is reported.
 #[cfg(target_os = "windows")]
 pub fn keyboard_focus_window() -> Option<HWND> {
-    let (focus, active) = thread_input_windows(foreground_thread_id());
-    if !focus.is_null() {
-        return Some(focus);
-    }
-    if !active.is_null() {
-        return Some(active);
-    }
-    let foreground = unsafe { GetForegroundWindow() };
-    (!foreground.is_null()).then_some(foreground)
+    InputContext::capture().focus
 }
 
 /// Whether `a` and `b` belong to the same top-level window.
@@ -509,25 +516,17 @@ fn store_paste_target(hwnd: HWND) {
 
 /// Sample the window that owns the user's input into the paste target.
 ///
-/// Called right before the quick popup is shown so the target reflects the
+/// Called before either Clippi window is shown so the target reflects the
 /// application the user was working in when they pressed the hotkey, even
-/// before any focus event has been observed. The foreground window is sampled
-/// first and the keyboard focus second, so a launcher palette that holds the
-/// caret without owning the foreground wins. Candidates that belong to Clippi
-/// are not targets, so the previous value is kept.
+/// before any focus event has been observed. One live input owner is selected:
+/// keyboard focus, then borrowed focus, then foreground. Only one update is
+/// made, avoiding a foreground/focus pair that temporarily records two targets.
+/// Clippi and shell tray windows cannot overwrite the previous target.
 #[cfg(target_os = "windows")]
 pub fn sample_paste_target() {
-    store_paste_target(unsafe { GetForegroundWindow() });
-    if let Some(focus) = keyboard_focus_window() {
-        store_paste_target(focus);
+    if let Some(owner) = InputContext::capture().live_owner() {
+        store_paste_target(owner);
     }
-}
-
-/// The current foreground window when it can receive a paste.
-#[cfg(target_os = "windows")]
-pub fn current_paste_target() -> Option<HWND> {
-    let fg = unsafe { GetForegroundWindow() };
-    is_valid_paste_target(fg).then_some(fg)
 }
 
 /// The foreign window that currently owns the user's input, if any.
@@ -544,20 +543,7 @@ pub fn current_paste_target() -> Option<HWND> {
 /// where the focus goes back when the popup is dismissed.
 #[cfg(target_os = "windows")]
 pub fn live_input_owner() -> Option<HWND> {
-    if let Some(hwnd) = keyboard_focus_window().filter(|&hwnd| is_foreign_input_window(hwnd)) {
-        return Some(hwnd);
-    }
-    // The quick popup can hold the keyboard focus on loan while it is on screen
-    // (`quick_focus`). That focus is given back the moment the popup hides, so
-    // the window it was borrowed from — and not a record of the last foreground
-    // application — is where the input returns and where a paste lands.
-    if let Some(borrowed) = crate::platform::quick_focus::borrowed_focus_owner() {
-        let borrowed = borrowed as HWND;
-        if is_foreign_input_window(borrowed) {
-            return Some(borrowed);
-        }
-    }
-    current_paste_target()
+    InputContext::capture().live_owner()
 }
 
 /// Whether `hwnd` belongs to another application and still exists.
@@ -574,7 +560,7 @@ fn is_foreign_input_window(hwnd: HWND) -> bool {
     if unsafe { IsWindow(hwnd) } == 0 {
         return false;
     }
-    !is_clippi_window(hwnd) && !is_own_process_window(hwnd)
+    !is_clippi_window(hwnd) && !is_own_process_window(hwnd) && !is_tray_window(hwnd)
 }
 
 /// Whether the window that owns the input sits outside the window in front.
@@ -587,11 +573,12 @@ fn is_foreign_input_window(hwnd: HWND) -> bool {
 /// first and leaves the palette alone.
 #[cfg(target_os = "windows")]
 pub fn input_detached_from_foreground() -> bool {
-    let Some(focus) = keyboard_focus_window() else {
+    let context = InputContext::capture();
+    let Some(focus) = context.focus else {
         return false;
     };
     // SAFETY: read-only query on a handle that is only observed.
-    let foreground = unsafe { GetForegroundWindow() };
+    let foreground = context.foreground;
     if foreground.is_null() {
         return false;
     }
@@ -629,8 +616,9 @@ pub fn paste_would_hit_clippi() -> bool {
 /// One-line description of where a simulated keystroke would land right now.
 #[cfg(target_os = "windows")]
 pub fn describe_input_context(target: Option<HWND>) -> String {
-    let focus = keyboard_focus_window();
-    let foreground = unsafe { GetForegroundWindow() };
+    let context = InputContext::capture();
+    let focus = context.focus;
+    let foreground = context.foreground;
     format!(
         "target={} focus={} foreground={}",
         target.map_or_else(|| "none".to_string(), describe_window),
@@ -657,22 +645,16 @@ pub fn resolve_paste_target() -> Option<HWND> {
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
     _event: u32,
-    hwnd: HWND,
+    _hwnd: HWND,
     _id_object: i32,
     _id_child: i32,
     _thread_id: u32,
     _timestamp: u32,
 ) {
-    // Use the HWND carried by the event. A `WINEVENT_OUTOFCONTEXT` callback runs
-    // after the fact on our message-pump thread, so re-reading
-    // `GetForegroundWindow()` would record whatever window happens to be
-    // foreground by then and could miss short-lived activations entirely.
-    let candidate = if hwnd.is_null() {
-        GetForegroundWindow()
-    } else {
-        hwnd
-    };
-    store_paste_target(candidate);
+    // Out-of-context events can arrive after the main window's boundary sample.
+    // Treat an event as a refresh signal, not an authoritative historical HWND:
+    // an old browser/tray event must not overwrite the sampled input owner.
+    sample_paste_target();
 }
 
 /// `EVENT_OBJECT_FOCUS` reports every keyboard-focus change, including the ones
@@ -682,18 +664,15 @@ unsafe extern "system" fn win_event_proc(
 unsafe extern "system" fn focus_object_proc(
     _hook: HWINEVENTHOOK,
     _event: u32,
-    hwnd: HWND,
-    id_object: i32,
+    _hwnd: HWND,
+    _id_object: i32,
     _id_child: i32,
     _thread_id: u32,
     _timestamp: u32,
 ) {
-    // Only window / client focus matters; skip the menu, caret, and
-    // value-change objects that share this event id.
-    if hwnd.is_null() || (id_object != OBJID_CLIENT && id_object != OBJID_WINDOW) {
-        return;
-    }
-    store_paste_target(hwnd);
+    // Custom accessible objects can emit focus changes with arbitrary IDs.
+    // Re-read the actual input queue through the same path as foreground events.
+    sample_paste_target();
 }
 
 // --- ── Foreground app info extraction ── ---
@@ -871,4 +850,46 @@ fn macos_foreground_info() -> Option<ForegroundAppInfo> {
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_tray_window_class, select_input_owner};
+
+    #[test]
+    fn focused_launcher_wins_even_when_its_root_is_hidden() {
+        let result = select_input_owner(Some(1), None, Some(2), |_| true, |w| w == 2);
+        assert_eq!(result, Some(1));
+    }
+
+    #[test]
+    fn borrowed_control_wins_over_foreground_while_clippi_has_focus() {
+        let result = select_input_owner(Some(1), Some(2), Some(3), |w| w != 1, |_| true);
+        assert_eq!(result, Some(2));
+    }
+
+    #[test]
+    fn tray_focus_and_foreground_do_not_supply_a_new_target() {
+        let result = select_input_owner(Some(1), None, Some(1), |_| false, |_| false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn foreground_is_used_when_no_valid_control_owns_input() {
+        let result = select_input_owner(Some(1), Some(2), Some(3), |_| false, |_| true);
+        assert_eq!(result, Some(3));
+    }
+
+    #[test]
+    fn tray_filter_does_not_exclude_generic_xaml_or_normal_apps() {
+        assert!(is_tray_window_class("TopLevelWindowForOverflowXamlIsland"));
+        assert!(is_tray_window_class("NotifyIconOverflowWindow"));
+        assert!(is_tray_window_class("Shell_TrayWnd"));
+        assert!(is_tray_window_class("Shell_SecondaryTrayWnd"));
+        assert!(!is_tray_window_class(
+            "Windows.UI.Input.InputSite.WindowClass"
+        ));
+        assert!(!is_tray_window_class("Qt51514QWindowIcon"));
+        assert!(!is_tray_window_class("CabinetWClass"));
+    }
 }

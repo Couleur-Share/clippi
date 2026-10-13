@@ -2286,7 +2286,10 @@ impl AppState {
         self.write_item_to_clipboard_internal(&item, copy_as_plain_text);
 
         if !expected.is_empty() && !is_file {
-            crate::services::clipboard_ops::verify_clipboard_content(&expected, 200);
+            let verified = crate::services::clipboard_ops::verify_clipboard_content(&expected, 200);
+            if !verified {
+                log::warn!("Clipboard text verification timed out while pasting item {id}");
+            }
         }
         if is_file {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2379,7 +2382,10 @@ impl AppState {
         self.write_item_as_plain_text_to_clipboard_internal(&item);
 
         if !expected.is_empty() {
-            crate::services::clipboard_ops::verify_clipboard_content(&expected, 200);
+            let verified = crate::services::clipboard_ops::verify_clipboard_content(&expected, 200);
+            if !verified {
+                log::warn!("Clipboard text verification timed out while pasting item {id}");
+            }
         }
         if is_file_or_image {
             std::thread::sleep(std::time::Duration::from_millis(50));

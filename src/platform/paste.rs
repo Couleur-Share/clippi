@@ -9,7 +9,7 @@
 //! processes at the same or a lower integrity level. A Clippi instance that is
 //! not elevated therefore cannot paste into an application running as
 //! administrator — Windows discards the keystroke without any visible error
-//! (`SendInput` returns 0 with `ERROR_ACCESS_DENIED`).
+//! (`SendInput` can return 0 without an error identifying UIPI).
 
 use std::sync::Arc;
 
@@ -349,12 +349,12 @@ fn send_paste_keystroke(shortcut: &PasteShortcut) {
             inputs.as_ptr(),
             std::mem::size_of::<INPUT>() as i32,
         );
+        // Read the error before any diagnostic window queries can overwrite it.
+        // Windows does not reliably identify UIPI through this error code.
+        let error = (inserted != inputs.len() as u32).then(|| GetLastError());
         if inserted != inputs.len() as u32 {
-            // `ERROR_ACCESS_DENIED` (5) is UIPI rejecting the input because the
-            // foreground window belongs to a higher integrity level process.
-            let error = GetLastError();
             log::warn!(
-                "SendInput inserted {inserted}/{} paste events (error {error})",
+                "SendInput inserted {inserted}/{} paste events (error {error:?})",
                 inputs.len()
             );
         }
@@ -463,7 +463,9 @@ fn activate_paste_target(target: windows_sys::Win32::Foundation::HWND) -> bool {
         let attached = target_thread != 0
             && target_thread != current_thread
             && AttachThreadInput(current_thread, target_thread, 1) != 0;
+        let attach_error = (!attached && target_thread != current_thread).then(|| GetLastError());
         let activated = SetForegroundWindow(target) != 0;
+        let activation_error = (!activated).then(|| GetLastError());
         SetWindowPos(
             target,
             HWND_TOP,
@@ -478,6 +480,13 @@ fn activate_paste_target(target: windows_sys::Win32::Foundation::HWND) -> bool {
         }
         if attached {
             AttachThreadInput(current_thread, target_thread, 0);
+        }
+        if !activated {
+            log::warn!(
+                "Paste target activation failed: target=0x{:X} attached={attached} \
+                 attach_error={attach_error:?} activation_error={activation_error:?}",
+                target as usize,
+            );
         }
         activated
     }
@@ -500,8 +509,7 @@ fn activate_paste_target(target: windows_sys::Win32::Foundation::HWND) -> bool {
 #[cfg(target_os = "windows")]
 pub fn restore_paste_target() -> bool {
     use crate::platform::focus::{
-        describe_input_context, describe_window, get_last_non_clippi_window,
-        is_restorable_paste_target, live_input_owner,
+        get_last_non_clippi_window, is_restorable_paste_target, live_input_owner,
     };
 
     // A foreign window that already owns the input is the paste target: leave
@@ -509,12 +517,7 @@ pub fn restore_paste_target() -> bool {
     // palette case, where the caret sits in a search box that is not the
     // foreground window — re-activating the recorded target there would dismiss
     // the palette and paste into the wrong application.
-    if let Some(live) = live_input_owner() {
-        log::info!(
-            "paste target: keeping live input owner {} ({})",
-            describe_window(live),
-            describe_input_context(Some(live))
-        );
+    if live_input_owner().is_some() {
         return true;
     }
 
@@ -527,32 +530,18 @@ pub fn restore_paste_target() -> bool {
         return false;
     };
 
-    if activate_paste_target(target) {
-        log::info!("paste target: activated {}", describe_window(target));
-        true
-    } else {
-        let error = unsafe { GetLastError() };
-        log::warn!(
-            "paste target: SetForegroundWindow failed (error {error}) for {}",
-            describe_window(target)
-        );
-        false
-    }
+    activate_paste_target(target)
 }
 
 /// Simulate paste after restoring focus.
 ///
-/// Accepts per-process shortcut config for override. The shortcut decision
-/// is resolved before spawning the thread so the boolean (not the settings
-/// collection) is captured.
+/// Resolve per-process shortcuts in the worker using the current input owner.
 #[cfg(target_os = "windows")]
 pub fn paste_after_delay(paste_shortcuts: Arc<Vec<crate::core::settings::PasteShortcutEntry>>) {
     std::thread::spawn(move || {
-        // Resolve the target inside the worker thread: the keystroke is sent
-        // after a short delay, by which time the foreground has settled.
-        let target_hwnd = crate::platform::focus::resolve_paste_target().map(|hwnd| hwnd as usize);
-        let shortcut = resolve_paste_shortcut(target_hwnd, &paste_shortcuts);
-        wait_for_focus_and_send_paste(target_hwnd, shortcut);
+        let target = crate::platform::focus::resolve_paste_target().map(|hwnd| hwnd as usize);
+        let shortcut = resolve_paste_shortcut(target, &paste_shortcuts);
+        wait_for_focus_and_send_paste(target, shortcut);
     });
 }
 
@@ -640,7 +629,6 @@ fn wait_for_focus_and_send_paste(target_hwnd: Option<usize>, shortcut: PasteShor
         std::thread::sleep(std::time::Duration::from_millis(FOCUS_CHECK_INTERVAL_MS));
     }
 
-    log::info!("Paste keystroke → {}", describe_input_context(Some(hwnd)));
     send_paste_keystroke(&shortcut);
 }
 

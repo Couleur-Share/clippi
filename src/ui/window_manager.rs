@@ -1976,6 +1976,10 @@ impl WindowManager {
     }
 
     fn poll_focus(&mut self, cx: &mut Context<Self>) {
+        // Refresh the shared input-owner record in the existing poll loop.
+        // Tray-restored custom windows do not always emit usable focus events.
+        #[cfg(target_os = "windows")]
+        crate::platform::focus::sample_paste_target();
         // Update foreground app name for blacklist
         self.update_foreground_app_name(cx);
 
@@ -2985,6 +2989,10 @@ impl WindowManager {
     /// period and brings the window to foreground — it skips repositioning
     /// and item reload to avoid disrupting the current view.
     pub fn show_and_focus(&mut self, cx: &mut Context<Self>) {
+        // Sample immediately before taking focus; the event-driven record may
+        // still refer to a tray window or the application behind a restored one.
+        #[cfg(target_os = "windows")]
+        crate::platform::focus::sample_paste_target();
         if self.quick_visible {
             self.hide_quick_window(cx);
         }

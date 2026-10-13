@@ -33,34 +33,13 @@ fn windows_text_input_anchor() -> Option<TextInputAnchor> {
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetCaretPos, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, GUITHREADINFO,
+        GetCaretPos, GetClassNameW, GetGUIThreadInfo, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, GUITHREADINFO,
     };
 
-    // Prefer the current foreground window — `get_last_non_clippi_window`
-    // is designed for paste-target restoration and may be stale when Clippi
-    // was recently in the foreground. Fall back to the stored value only when
-    // Clippi itself is the foreground window.
-    let fg = unsafe { GetForegroundWindow() };
-    let foreground_hwnd: Option<HWND> = (|| {
-        if fg.is_null() {
-            log::debug!("text_input_anchor: GetForegroundWindow returned null");
-            return None;
-        }
-        let mut pid: u32 = 0;
-        // SAFETY: GetWindowThreadProcessId is a read-only query.
-        let tid = unsafe { GetWindowThreadProcessId(fg, &mut pid) };
-        if tid == 0 || pid == std::process::id() {
-            log::debug!(
-                "text_input_anchor: foreground belongs to Clippi (pid={}, tid={})",
-                pid,
-                tid
-            );
-            return None; // window is invalid or belongs to Clippi
-        }
-        Some(fg)
-    })();
-    let target = match foreground_hwnd.or_else(crate::platform::focus::get_last_non_clippi_window) {
+    // Share input-owner selection with paste and the footer, including launcher
+    // palettes and borrowed focus. Anchor detection itself remains best-effort.
+    let target = match crate::platform::focus::resolve_paste_target() {
         Some(hwnd) => {
             // Log target window identity once for diagnostics
             unsafe {
