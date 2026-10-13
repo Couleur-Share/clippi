@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_transitions::WindowUseTransition;
 
@@ -45,6 +45,7 @@ pub struct AddBackendPanel {
     _test_task: Option<Task<()>>,
     _folder_dialog_task: Option<Task<()>>,
     last_lang_version: u64,
+    _input_subscriptions: Vec<Subscription>,
 }
 
 impl AddBackendPanel {
@@ -54,7 +55,7 @@ impl AddBackendPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self {
+        let mut panel = Self {
             visible: false,
             animation_generation: 0,
             animation_started: None,
@@ -85,7 +86,25 @@ impl AddBackendPanel {
             _test_task: None,
             _folder_dialog_task: None,
             last_lang_version: crate::core::i18n::lang_version(),
+            _input_subscriptions: Vec::new(),
+        };
+        for input in [
+            &panel.url_input,
+            &panel.webdav_path_input,
+            &panel.username_input,
+            &panel.password_input,
+        ] {
+            panel._input_subscriptions.push(cx.subscribe(
+                input,
+                |panel, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        panel.reset_test();
+                        cx.notify();
+                    }
+                },
+            ));
         }
+        panel
     }
 
     pub fn is_visible(&self) -> bool {
@@ -171,6 +190,7 @@ impl AddBackendPanel {
     }
 
     fn reset_test(&mut self) {
+        self._test_task = None;
         self.test_pending = false;
         self.test_ok = false;
         self.test_error.clear();
@@ -540,88 +560,120 @@ impl AddBackendPanel {
                     ),
             )
             .child(div().h(px(1.)).bg(divider))
-            .when(!self.test_error.is_empty(), |form| {
-                form.child(
-                    div()
-                        .text_size(fs(11.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(self.theme.danger)
-                        .child(self.test_error.clone()),
-                )
-            })
-            .when(!self.test_ok, |form| {
-                form.child(primary_button(
-                    if self.test_pending {
-                        I18nKey::BackendTesting.text()
-                    } else {
-                        I18nKey::BackendTest.text()
-                    },
-                    accent,
-                    accent_soft,
-                    {
-                        let this = this.clone();
-                        move |_window, cx| {
-                            this.update(cx, |panel, cx| {
-                                panel.start_webdav_test(cx);
-                            });
-                        }
-                    },
-                ))
-            })
-            .when(self.test_ok, |form| {
-                form.child(primary_button(
-                    if editing {
-                        I18nKey::BackendSave.text()
-                    } else {
-                        I18nKey::BackendAddTitle.text()
-                    },
-                    rgb(0x4caf50),
-                    accent_soft,
-                    {
-                        let name_input = self.name_input.clone();
-                        let url_input = self.url_input.clone();
-                        let path_input = self.webdav_path_input.clone();
-                        let username_input = self.username_input.clone();
-                        let password_input = self.password_input.clone();
-                        let edit_id = self.edit_id.clone();
-                        let wm = self.window_manager.clone();
-                        move |window, cx| {
-                            let name = name_input.read(cx).value().to_string();
-                            if name.trim().is_empty() {
-                                name_input
-                                    .update(cx, |input, cx| input.focus_handle(cx).focus(window));
-                                wm.update(cx, |wm, cx| {
-                                    wm.show_warning_toast(I18nKey::BackendNameRequired.text(), cx);
-                                });
-                                return;
-                            }
-                            let root_url = url_input.read(cx).value().to_string();
-                            let path = path_input.read(cx).value().to_string();
-                            let url = compose_webdav_url(&root_url, &path);
-                            if url.trim().is_empty() {
-                                return;
-                            }
-                            let username = username_input.read(cx).value().to_string();
-                            let password = password_input.read(cx).unmask_value().to_string();
-                            wm.update(cx, |wm, cx| {
-                                let form = WebDavBackendForm {
-                                    name,
-                                    root_url,
-                                    path,
-                                    username,
-                                    password,
-                                };
-                                if let Some(id) = edit_id.as_deref() {
-                                    wm.edit_webdav_backend(id, form, cx);
-                                } else {
-                                    wm.add_webdav_backend(form, cx);
+            .child(
+                div()
+                    .flex()
+                    .gap(px(7.))
+                    .child(div().flex_1().child(primary_button(
+                        if editing {
+                            I18nKey::BackendSave.text()
+                        } else {
+                            I18nKey::BackendAddTitle.text()
+                        },
+                        accent,
+                        accent_soft,
+                        {
+                            let this = this.clone();
+                            let name_input = self.name_input.clone();
+                            let url_input = self.url_input.clone();
+                            let path_input = self.webdav_path_input.clone();
+                            let username_input = self.username_input.clone();
+                            let password_input = self.password_input.clone();
+                            let edit_id = self.edit_id.clone();
+                            let wm = self.window_manager.clone();
+                            move |window, cx| {
+                                let name = name_input.read(cx).value().to_string();
+                                if name.trim().is_empty() {
+                                    name_input.update(cx, |input, cx| {
+                                        input.focus_handle(cx).focus(window)
+                                    });
+                                    wm.update(cx, |wm, cx| {
+                                        wm.show_warning_toast(
+                                            I18nKey::BackendNameRequired.text(),
+                                            cx,
+                                        );
+                                    });
+                                    return;
                                 }
-                            });
-                            this.update(cx, |panel, cx| panel.close(cx));
-                        }
-                    },
-                ))
-            })
+                                let root_url = url_input.read(cx).value().to_string();
+                                if root_url.trim().is_empty() {
+                                    url_input.update(cx, |input, cx| {
+                                        input.focus_handle(cx).focus(window)
+                                    });
+                                    wm.update(cx, |wm, cx| {
+                                        wm.show_warning_toast(
+                                            I18nKey::BackendUrlRequired.text(),
+                                            cx,
+                                        );
+                                    });
+                                    return;
+                                }
+                                let path = path_input.read(cx).value().to_string();
+                                let username = username_input.read(cx).value().to_string();
+                                let password = password_input.read(cx).unmask_value().to_string();
+                                wm.update(cx, |wm, cx| {
+                                    let form = WebDavBackendForm {
+                                        name,
+                                        root_url,
+                                        path,
+                                        username,
+                                        password,
+                                    };
+                                    if let Some(id) = edit_id.as_deref() {
+                                        wm.edit_webdav_backend(id, form, cx);
+                                    } else {
+                                        wm.add_webdav_backend(form, cx);
+                                    }
+                                });
+                                this.update(cx, |panel, cx| panel.close(cx));
+                            }
+                        },
+                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(34.))
+                            .rounded(px(7.))
+                            .bg(self.theme.surface_press)
+                            .text_size(fs(12.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(self.theme.text_1)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(10.))
+                            .cursor(CursorStyle::PointingHand)
+                            .hover({
+                                let hover = self.theme.divider;
+                                move |style| style.bg(hover)
+                            })
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                this.update(cx, |panel, cx| panel.start_webdav_test(cx));
+                            })
+                            .child(
+                                div()
+                                    .line_height(fs(14.))
+                                    .text_color(if self.test_pending {
+                                        self.theme.text_1
+                                    } else if self.test_ok {
+                                        rgb(0x4caf50)
+                                    } else if !self.test_error.is_empty() {
+                                        self.theme.danger
+                                    } else {
+                                        self.theme.text_1
+                                    })
+                                    .child(if self.test_pending {
+                                        I18nKey::BackendTesting.text()
+                                    } else if self.test_ok {
+                                        I18nKey::BackendTestSuccess.text()
+                                    } else if !self.test_error.is_empty() {
+                                        I18nKey::BackendTestFailed.text()
+                                    } else {
+                                        I18nKey::BackendTest.text()
+                                    }),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 }
@@ -718,7 +770,7 @@ impl Render for AddBackendPanel {
                                     .flex()
                                     .flex_1()
                                     .items_center()
-                                    .gap(px(6.))
+                                    .gap(px(10.))
                                     .when(show_back, |header| {
                                         header.child(
                                             div()

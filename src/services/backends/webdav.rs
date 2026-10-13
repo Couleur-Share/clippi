@@ -24,7 +24,7 @@ enum CollectionCheck {
 }
 
 fn is_success_status(status: u16) -> bool {
-    (200..400).contains(&status)
+    (200..300).contains(&status)
 }
 
 fn is_auth_status(status: u16) -> bool {
@@ -50,18 +50,73 @@ fn require_committed_write(status: u16, operation: &str) -> Result<(), String> {
     }
 }
 
+/// Collections are directories, whereas payload/blob URLs are files.
+fn collection_url(url: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(url) {
+        let path = format!("{}/", parsed.path().trim_end_matches('/'));
+        parsed.set_path(&path);
+        parsed.to_string()
+    } else {
+        format!("{}/", url.trim_end_matches('/'))
+    }
+}
+
+/// Follow DAV redirects without changing the method or leaking credentials to
+/// another origin. ureq's browser-style redirects turn PROPFIND/MKCOL into GET.
+// Keep ureq's response-bearing error so callers can inspect DAV status codes.
+#[allow(clippy::result_large_err)]
+fn request_collection(
+    method: &str,
+    url: &str,
+    auth: &str,
+    depth: Option<&str>,
+) -> Result<ureq::Response, ureq::Error> {
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(REQUEST_TIMEOUT)
+        .build();
+    let mut current = collection_url(url);
+    for redirect in 0..=5 {
+        let mut request = agent.request(method, &current).set("Authorization", auth);
+        if let Some(depth) = depth {
+            request = request.set("Depth", depth);
+        }
+        let response = request.call()?;
+        if !matches!(response.status(), 301 | 302 | 303 | 307 | 308) {
+            return Ok(response);
+        }
+        if redirect == 5 {
+            return Err(ureq::Error::Status(response.status(), response));
+        }
+        let next = response.header("Location").and_then(|location| {
+            let previous = url::Url::parse(&current).ok()?;
+            let next = previous.join(location).ok()?;
+            (previous.origin() == next.origin()
+                && next.username().is_empty()
+                && next.password().is_none())
+            .then(|| next.to_string())
+        });
+        let Some(next) = next else {
+            return Err(ureq::Error::Status(response.status(), response));
+        };
+        current = next;
+    }
+    unreachable!("bounded redirect loop always returns")
+}
+
 pub fn check_webdav_connection(
     agent: &ureq::Agent,
     url: &str,
     auth: &str,
 ) -> Result<(), BackendStatus> {
-    let base = url.trim_end_matches('/');
-    let file_url = format!("{base}/{SYNC_FILENAME}");
+    let base_url = collection_url(url);
+    let base = base_url.as_str();
+    let file_url = format!("{}/{SYNC_FILENAME}", base.trim_end_matches('/'));
 
-    match check_collection(agent, base, auth) {
+    match check_collection(base, auth) {
         CollectionCheck::Exists => return Ok(()),
         CollectionCheck::Missing => {
-            if create_collection_path(agent, base, auth).is_ok() {
+            if create_collection_path(base, auth).is_ok() {
                 return Ok(());
             }
         }
@@ -69,12 +124,7 @@ pub fn check_webdav_connection(
     }
 
     // Fallback for WebDAV-compatible endpoints that do not support PROPFIND.
-    match agent
-        .request("PROPFIND", base)
-        .set("Authorization", auth)
-        .set("Depth", "0")
-        .call()
-    {
+    match request_collection("PROPFIND", base, auth, Some("0")) {
         Ok(response) if is_success_status(response.status()) => return Ok(()),
         Ok(response) if is_auth_status(response.status()) => {
             return Err(BackendStatus::Error(I18nKey::SyncErrAuth.text().into()));
@@ -107,13 +157,8 @@ pub fn check_webdav_connection(
     Err(BackendStatus::Error(I18nKey::SyncErrConnect.text().into()))
 }
 
-fn check_collection(agent: &ureq::Agent, url: &str, auth: &str) -> CollectionCheck {
-    match agent
-        .request("PROPFIND", url)
-        .set("Authorization", auth)
-        .set("Depth", "0")
-        .call()
-    {
+fn check_collection(url: &str, auth: &str) -> CollectionCheck {
+    match request_collection("PROPFIND", url, auth, Some("0")) {
         Ok(response) if is_success_status(response.status()) => CollectionCheck::Exists,
         Ok(response) if is_auth_status(response.status()) => {
             CollectionCheck::Error(BackendStatus::Error(I18nKey::SyncErrAuth.text().into()))
@@ -133,7 +178,7 @@ fn check_collection(agent: &ureq::Agent, url: &str, auth: &str) -> CollectionChe
     }
 }
 
-fn create_collection_path(agent: &ureq::Agent, url: &str, auth: &str) -> Result<(), BackendStatus> {
+fn create_collection_path(url: &str, auth: &str) -> Result<(), BackendStatus> {
     let Some((origin, path_segments)) = split_url_path(url) else {
         return Err(BackendStatus::Error(I18nKey::SyncErrConnect.text().into()));
     };
@@ -144,7 +189,7 @@ fn create_collection_path(agent: &ureq::Agent, url: &str, auth: &str) -> Result<
     let mut missing = Vec::new();
     for end in (1..=path_segments.len()).rev() {
         let candidate = join_url(&origin, &path_segments[..end]);
-        match check_collection(agent, &candidate, auth) {
+        match check_collection(&candidate, auth) {
             CollectionCheck::Exists => {
                 missing = path_segments[end..].to_vec();
                 break;
@@ -163,11 +208,7 @@ fn create_collection_path(agent: &ureq::Agent, url: &str, auth: &str) -> Result<
     for segment in missing {
         current.push(segment);
         let collection_url = join_url(&origin, &current);
-        match agent
-            .request("MKCOL", &collection_url)
-            .set("Authorization", auth)
-            .call()
-        {
+        match request_collection("MKCOL", &collection_url, auth, None) {
             Ok(response) if (200..300).contains(&response.status()) => {}
             Err(ureq::Error::Status(405, _)) => {}
             Err(ureq::Error::Status(409, _)) => {}
@@ -182,7 +223,7 @@ fn create_collection_path(agent: &ureq::Agent, url: &str, auth: &str) -> Result<
         }
     }
 
-    match check_collection(agent, url, auth) {
+    match check_collection(url, auth) {
         CollectionCheck::Exists => Ok(()),
         CollectionCheck::Missing => {
             Err(BackendStatus::Error(I18nKey::SyncErrConnect.text().into()))
@@ -433,11 +474,7 @@ impl SyncBackend for WebDAVBackend {
         let auth = self.auth_header();
 
         // Ensure images/ directory exists (try MKCOL, ignore if already exists)
-        let _ = self
-            .agent
-            .request("MKCOL", &images_url)
-            .set("Authorization", &auth)
-            .call();
+        let _ = request_collection("MKCOL", &images_url, &auth, None);
 
         let content_type = match ext {
             "jpg" | "jpeg" => "image/jpeg",
@@ -484,13 +521,7 @@ impl SyncBackend for WebDAVBackend {
         let images_url = format!("{base}/images/");
         let auth = self.auth_header();
 
-        match self
-            .agent
-            .request("PROPFIND", &images_url)
-            .set("Authorization", &auth)
-            .set("Depth", "1")
-            .call()
-        {
+        match request_collection("PROPFIND", &images_url, &auth, Some("1")) {
             Ok(resp) => {
                 let body = resp
                     .into_string()
@@ -609,11 +640,7 @@ impl SyncBackend for WebDAVBackend {
         let auth = self.auth_header();
 
         // Ensure files/ directory exists
-        let _ = self
-            .agent
-            .request("MKCOL", &files_url)
-            .set("Authorization", &auth)
-            .call();
+        let _ = request_collection("MKCOL", &files_url, &auth, None);
 
         match self
             .agent
@@ -818,6 +845,102 @@ mod tests {
     use crate::core::config_sync::{ConfigSyncError, MAX_CONFIG_SNAPSHOT_BYTES};
     use crate::services::backends::ConfigSnapshotBackend;
 
+    #[test]
+    fn collection_redirects_preserve_dav_method_and_auth() {
+        for method in ["PROPFIND", "MKCOL"] {
+            for status in [301, 302, 303, 307, 308] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = std::thread::spawn(move || {
+                    for step in 0..2 {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut bytes = [0; 4096];
+                        let read = stream.read(&mut bytes).unwrap();
+                        let request = String::from_utf8_lossy(&bytes[..read]);
+                        let path = if step == 0 {
+                            "/collection/"
+                        } else {
+                            "/canonical"
+                        };
+                        assert!(request.starts_with(&format!("{method} {path} HTTP/1.1")));
+                        assert!(request
+                            .to_ascii_lowercase()
+                            .contains("authorization: basic test"));
+                        if method == "PROPFIND" {
+                            assert!(request.to_ascii_lowercase().contains("depth: 0"));
+                        }
+                        let response = if step == 0 {
+                            format!("HTTP/1.1 {status} Redirect\r\nLocation: /canonical\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        } else {
+                            "HTTP/1.1 207 Multi-Status\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        };
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                });
+                let response = request_collection(
+                    method,
+                    &format!("http://{address}/collection"),
+                    "Basic test",
+                    Some("0"),
+                )
+                .unwrap();
+                assert_eq!(response.status(), 207);
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn collection_redirects_reject_cross_origin_and_missing_location() {
+        for location in ["Location: http://127.0.0.1:1/private\r\n", ""] {
+            let (address, server) = serve_once("PROPFIND", format!("HTTP/1.1 301 Redirect\r\n{location}Content-Length: 0\r\nConnection: close\r\n\r\n").into_bytes());
+            assert!(request_collection(
+                "PROPFIND",
+                &format!("http://{address}/dav"),
+                "Basic test",
+                Some("0")
+            )
+            .is_err());
+            server.join().unwrap();
+        }
+    }
+    #[test]
+    fn collection_urls_preserve_encoded_paths_and_queries() {
+        assert_eq!(
+            collection_url("https://example.com/dav/a%20b?token=test"),
+            "https://example.com/dav/a%20b/?token=test"
+        );
+        assert_eq!(
+            collection_url("https://example.com/dav/"),
+            "https://example.com/dav/"
+        );
+        assert!(!is_success_status(301));
+    }
+
+    #[test]
+    fn collection_redirect_loops_are_bounded() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0; 4096];
+                assert!(stream.read(&mut bytes).unwrap() > 0);
+                stream.write_all(b"HTTP/1.1 301 Redirect\r\nLocation: /dav/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+        });
+        assert!(request_collection(
+            "PROPFIND",
+            &format!("http://{address}/dav"),
+            "Basic test",
+            Some("0")
+        )
+        .is_err());
+        server.join().unwrap();
+    }
     fn webdav_backend(address: &str) -> WebDAVBackend {
         WebDAVBackend::new(BackendConfig {
             id: "test".into(),
